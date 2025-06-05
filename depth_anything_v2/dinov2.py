@@ -409,7 +409,7 @@ def DINOv2(model_name):
         init_values=1.0,
         ffn_layer="mlp" if model_name != "vitg" else "swiglufused",
         block_chunks=0,
-        num_register_tokens=0,
+        num_register_tokens=4,
         interpolate_antialias=False,
         interpolate_offset=0.1
     )

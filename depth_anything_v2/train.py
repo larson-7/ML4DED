@@ -26,8 +26,10 @@ from util.nyu_d_v2.nyudv2_seg_dataset import NYUSDv2SegDataset
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Semantic Segmentation Training With Pytorch')
-    parser.add_argument('--data-dir', type=str, default="/home/jordan/omscs/cs8903/SegDefDepth/data/nyu_depth_v2/official_splits",
+    parser.add_argument('--data-dir', type=str, default="../data/nyu_depth_v2",
                         help='train/test data directory')
+    parser.add_argument('--model-weights-dir', type=str, default="../model_weights",
+                        help='pretrained model weights directory')
 
     parser.add_argument('--base-size', type=int, default=580,
                         help='base image size')
@@ -52,19 +54,27 @@ def parse_args():
     return args
 
 
+def make_divisible(val, divisor=14):
+    return val - (val % divisor)
+
+
 class Trainer(object):
     def __init__(self, args):
         self.args = args
         self.device = torch.device(args.device)
 
-        # image transform
+        # NYUv2: original size is 640×480 → crop to 630×476 for compatibility
+        img_h, img_w = make_divisible(480), make_divisible(640)
+
+        # image transform (normalize to imagenet mean statistics)
         input_transform = transforms.Compose([
+            transforms.CenterCrop((img_h, img_w)),
             transforms.ToTensor(),
             transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
         ])
         # dataset and dataloader
         trainset = NYUSDv2SegDataset(args.data_dir, transform=input_transform)
-        valset = NYUSDv2SegDataset(args.data_dir, 'val', transform=input_transform)
+        valset = NYUSDv2SegDataset(args.data_dir, 'test', transform=input_transform)
 
         self.train_loader = data.DataLoader(dataset=trainset, batch_size=args.batch_size,
                                             pin_memory=True)
@@ -73,22 +83,31 @@ class Trainer(object):
 
         # DINOv2 backbone vision encoder
         self.backbone = DINOv2("vitb")
+        model_weight_path = os.path.join(args.model_weights_dir, "dinov2_vitb14_reg4_pretrain.pth")
+        state_dict = torch.load(model_weight_path, map_location='cpu')
+        # load the weights into the model
+        missing_keys, unexpected_keys = self.backbone.load_state_dict(state_dict, strict=False)
+
+        # print warnings if keys don't match exactly
+        if missing_keys:
+            print("[Warning] Missing keys:", missing_keys)
+        if unexpected_keys:
+            print("[Warning] Unexpected keys:", unexpected_keys)
+
         self.backbone.to(self.device)
         self.backbone.eval()
         # freeze weights for backbone
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        self.model = Dino2Seg(embed_dim=1,
-                              num_classes=len(self.train_loader.classes),
-                              hidden_dim=512,
-                              patch_size=14)(self.device)
 
-        # create criterion
-        a = 1 / 42
-        b = (1 - a) / 20
-        weights = torch.tensor([a] + [b for _ in range(20)]).to('cuda')
-        self.criterion = nn.CrossEntropyLoss(weight=weights)
+        # segmentation head
+        self.model = Dino2Seg(embed_dim=768,
+                              num_classes=len(trainset.classes),
+                              hidden_dim=512,
+                              patch_size=14).to(self.device)
+
+        self.criterion = nn.CrossEntropyLoss(ignore_index=255)
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(),
                                            lr=args.lr)
@@ -124,14 +143,14 @@ class Trainer(object):
                     writer.add_scalar('training loss', avg_loss.item() / 100, iteration)
                     avg_loss = 0
 
-                # if iteration % 1000 == 1:
-                #     pred = decode_segmap(pred[0].cpu().data.numpy())
-                #     gt = decode_segmap(targets[0].cpu().data.numpy())
+                if iteration % 1000 == 1:
+                    pred = decode_segmap(pred[0].cpu().data.numpy())
+                    gt = decode_segmap(targets[0].cpu().data.numpy())
 
-                #     pred = torch.from_numpy(pred).permute(2, 0, 1)
-                #     gt = torch.from_numpy(gt).permute(2, 0, 1)
-                #     writer.add_image("pred", pred, iteration)
-                #     writer.add_image("gt", gt, iteration)
+                    pred = torch.from_numpy(pred).permute(2, 0, 1)
+                    gt = torch.from_numpy(gt).permute(2, 0, 1)
+                    writer.add_image("pred", pred, iteration)
+                    writer.add_image("gt", gt, iteration)
 
     def validation(self, it, e):
         # total_inter, total_union, total_correct, total_label = 0, 0, 0, 0
@@ -147,7 +166,8 @@ class Trainer(object):
             target = target.to(self.device)
 
             with torch.no_grad():
-                outputs = self.model(image)
+                encoder_outs = self.backbone(image)
+                outputs = self.model(encoder_outs)
             self.metric.update(outputs, target)
             pixAcc, mIoU = self.metric.get()
 
