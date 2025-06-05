@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from depth_anything_v2.base import ConvBlock
 
 
-class SimpleSegHead(nn.Module):
+class Dino2Seg(nn.Module):
     """
     tokens ─► Linear ─► ReLU ─► Conv2d ─►  low‑res logits  (no upsample)
     --------------------------------------------------------------------

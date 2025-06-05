@@ -5,28 +5,29 @@ import os
 import shutil
 import sys
 from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.utils.data as data
+import torch.backends.cudnn as cudnn
+from torch.utils.tensorboard import SummaryWriter
+import torchvision
+from torchvision import transforms
 
 cur_path = os.path.abspath(os.path.dirname(__file__))
 root_path = os.path.split(cur_path)[0]
 sys.path.append(root_path)
 
-import torch
-import torch.nn as nn
-import torch.utils.data as data
-import torch.backends.cudnn as cudnn
-
-import torchvision
-from torchvision import transforms
-from models.dino2 import DINO2SEG
-from utils.mscoco import COCOSegmentation
-from utils.segmentationMetric import *
-from utils.vis import decode_segmap
-
-from tensorboardX import SummaryWriter
+from dino2seg import Dino2Seg
+from util.segmentationMetric import *
+from util.vis import decode_segmap
+from depth_anything_v2.dinov2 import DINOv2
+from util.nyu_d_v2.nyudv2_seg_dataset import NYUSDv2SegDataset
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Semantic Segmentation Training With Pytorch')
+    parser.add_argument('--data-dir', type=str, default="/home/jordan/omscs/cs8903/SegDefDepth/data/nyu_depth_v2/official_splits",
+                        help='train/test data directory')
 
     parser.add_argument('--base-size', type=int, default=580,
                         help='base image size')
@@ -36,7 +37,7 @@ def parse_args():
     # training hyper params
     parser.add_argument('--batch-size', type=int, default=8, metavar='N',
                         help='input batch size for training (default: 8)')
-    parser.add_argument('--epochs', type=int, default=20, metavar='N',
+    parser.add_argument('--epochs', type=int, default=50, metavar='N',
                         help='number of epochs to train (default: 50)')
     parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
                         help='learning rate (default: 1e-4)')
@@ -45,6 +46,8 @@ def parse_args():
     parser.add_argument('--save-dir', default='./ckpt',
                         help='Directory for saving checkpoint models')
 
+    parser.add_argument('--device', default='cuda',
+                        help='Training device')
     args = parser.parse_args()
     return args
 
@@ -60,15 +63,26 @@ class Trainer(object):
             transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
         ])
         # dataset and dataloader
-        trainset = COCOSegmentation('/mnt/2tb/mscoco/', transform=input_transform)
-        valset = COCOSegmentation('/mnt/2tb/mscoco/', 'val', transform=input_transform)
+        trainset = NYUSDv2SegDataset(args.data_dir, transform=input_transform)
+        valset = NYUSDv2SegDataset(args.data_dir, 'val', transform=input_transform)
 
         self.train_loader = data.DataLoader(dataset=trainset, batch_size=args.batch_size,
                                             pin_memory=True)
         self.val_loader = data.DataLoader(dataset=valset, batch_size=args.batch_size,
                                           pin_memory=True)
 
-        self.model = nn.DataParallel(DINO2SEG(len(trainset.classes)).to(self.device))
+        # DINOv2 backbone vision encoder
+        self.backbone = DINOv2("vitb")
+        self.backbone.to(self.device)
+        self.backbone.eval()
+        # freeze weights for backbone
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        self.model = Dino2Seg(embed_dim=1,
+                              num_classes=len(self.train_loader.classes),
+                              hidden_dim=512,
+                              patch_size=14)(self.device)
 
         # create criterion
         a = 1 / 42
