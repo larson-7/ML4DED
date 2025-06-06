@@ -1,9 +1,9 @@
 # nyu_official_seg.py
+# from https://github.com/xapharius/pytorch-nyuv2/blob/master/nyuv2/nyuv2.py
 # ----------------------------------------------------------------------
 import os
 import torch
 import numpy as np
-
 from glob import glob
 from PIL import Image
 from depth_anything_v2.util.segbase import SegmentationDataset
@@ -128,8 +128,14 @@ class NYUSDv2SegDataset(SegmentationDataset):
     def __len__(self):
         return len(self.files)
 
+    # def _mask_transform(self, mask):
+    #     return torch.from_numpy(np.array(mask, dtype='uint8')).long()
+
     def _mask_transform(self, mask):
-        return torch.from_numpy(np.array(mask, dtype='uint8')).long()
+        return mask  # PIL if torchvision transform is applied later
+
+    def _img_transform(self, img):
+        return img  # keep as PIL for torchvision
 
     @property
     def classes(self):

@@ -17,7 +17,7 @@ cur_path = os.path.abspath(os.path.dirname(__file__))
 root_path = os.path.split(cur_path)[0]
 sys.path.append(root_path)
 
-from dino2seg import Dino2Seg
+from dino2seg import Dino2Seg, DPTSegmentationHead
 from util.segmentationMetric import *
 from util.vis import decode_segmap
 from depth_anything_v2.dinov2 import DINOv2
@@ -72,9 +72,14 @@ class Trainer(object):
             transforms.ToTensor(),
             transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
         ])
+
+        seg_transform = transforms.Compose([
+            transforms.CenterCrop((img_h, img_w)),
+            transforms.ToTensor()])
+
         # dataset and dataloader
-        trainset = NYUSDv2SegDataset(args.data_dir, transform=input_transform)
-        valset = NYUSDv2SegDataset(args.data_dir, 'test', transform=input_transform)
+        trainset = NYUSDv2SegDataset(args.data_dir, split="train", mode="train", transform=input_transform, seg_transform=seg_transform)
+        valset = NYUSDv2SegDataset(args.data_dir, split="test", mode="val", transform=input_transform, seg_transform=seg_transform)
 
         self.train_loader = data.DataLoader(dataset=trainset, batch_size=args.batch_size,
                                             pin_memory=True)
@@ -100,12 +105,20 @@ class Trainer(object):
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-
         # segmentation head
-        self.model = Dino2Seg(embed_dim=768,
-                              num_classes=len(trainset.classes),
-                              hidden_dim=512,
-                              patch_size=14).to(self.device)
+        # self.model = Dino2Seg(embed_dim=768,
+        #                       num_classes=len(trainset.classes),
+        #                       hidden_dim=512,
+        #                       patch_size=14,
+        #                       image_height=img_h,
+        #                       image_width=img_w).to(self.device)
+
+        self.model = DPTSegmentationHead(
+            in_channels=768,
+            num_classes=len(trainset.classes),
+            image_height=img_h,
+            image_width=img_w,
+            patch_size=14).to(self.device)
 
         self.criterion = nn.CrossEntropyLoss(ignore_index=255)
 
@@ -166,7 +179,8 @@ class Trainer(object):
             target = target.to(self.device)
 
             with torch.no_grad():
-                encoder_outs = self.backbone(image)
+                backbone_features = self.backbone.forward_features(image)
+                encoder_outs = backbone_features["x_norm_patchtokens"]
                 outputs = self.model(encoder_outs)
             self.metric.update(outputs, target)
             pixAcc, mIoU = self.metric.get()
