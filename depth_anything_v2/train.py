@@ -37,9 +37,9 @@ def parse_args():
                         help='crop image size')
 
     # training hyper params
-    parser.add_argument('--batch-size', type=int, default=8, metavar='N',
+    parser.add_argument('--batch-size', type=int, default=16, metavar='N',
                         help='input batch size for training (default: 8)')
-    parser.add_argument('--epochs', type=int, default=50, metavar='N',
+    parser.add_argument('--epochs', type=int, default=100, metavar='N',
                         help='number of epochs to train (default: 50)')
     parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
                         help='learning rate (default: 1e-4)')
@@ -118,8 +118,8 @@ class Trainer(object):
                 targets = targets.to(self.device)
                 outputs = self.model(images)
                 pred = torch.max(outputs, 1).indices
-                loss = self.criterion(outputs, targets)
 
+                loss = self.criterion(outputs, targets.squeeze(1))
                 loss = torch.mean(loss)
 
                 self.optimizer.zero_grad()
@@ -134,7 +134,7 @@ class Trainer(object):
 
                 if iteration % 1000 == 1:
                     pred = decode_segmap(pred[0].cpu().data.numpy())
-                    gt = decode_segmap(targets[0].cpu().data.numpy())
+                    gt = decode_segmap(targets[0].squeeze(0).cpu().data.numpy())
 
                     pred = torch.from_numpy(pred).permute(2, 0, 1)
                     gt = torch.from_numpy(gt).permute(2, 0, 1)
@@ -153,6 +153,7 @@ class Trainer(object):
         for image, target, _ in tqdm(self.val_loader):
             image = image.to(self.device)
             target = target.to(self.device)
+            target = target.squeeze(1)
 
             with torch.no_grad():
                 outputs = self.model(image)
@@ -187,12 +188,12 @@ def save_checkpoint(model, args, is_best=False):
     directory = os.path.expanduser(args.save_dir)
     if not os.path.exists(directory):
         os.makedirs(directory)
-    filename = f"dinov2_mscoco.pth"
+    filename = f"dinov2_seg.pth"
     filename = os.path.join(directory, filename)
 
     torch.save(model.state_dict(), filename)
     if is_best:
-        best_filename = 'dinov2_mscoco_best_model.pth'
+        best_filename = 'dinov2_seg_best_model.pth'
         best_filename = os.path.join(directory, best_filename)
         shutil.copyfile(filename, best_filename)
 

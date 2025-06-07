@@ -12,10 +12,11 @@
 #       /out/dir/{train,test}/{scene}/
 #               rgb_00000.jpg
 #               sync_depth_00000.png
-#               seg40_00000.png
+#               seg40_00000.png       (40-class labels: 0-39 + 255)
+#               seg_raw_00000.png     (raw labels: 0-255)
 
 #   The seg PNG is uint8 with values 0‑39. Pixels whose raw label maps to
-#   class 0 in NYU’s 40‑class definition are unlikely / void – feel free
+#   class 0 in NYU's 40‑class definition are unlikely / void – feel free
 #   to treat 0 or 255 as ignore‑index in your loss.
 # ----------------------------------------------------------------------
 
@@ -29,7 +30,7 @@ import sys
 import cv2
 
 
-def convert_image(i, scene, depth_raw, image, label_raw):
+def convert_image(i, scene, depth_raw, image, label_raw, label_40class):
     idx = i + 1  # 1‑based in splits.mat
 
     train_test = "train" if idx in train_images else "test"
@@ -48,8 +49,13 @@ def convert_image(i, scene, depth_raw, image, label_raw):
 
     # ------- segmentation (40‑class, same crop) -----------------------
     seg_out = np.full((480, 640), 255, dtype=np.uint8)  # init to void
-    seg_out[7:474, 7:632] = label_raw[7:474, 7:632]
+    seg_out[7:474, 7:632] = label_40class.T[7:474, 7:632] #label images come in rotated 90deg
     cv2.imwrite(f"{folder}/seg40_{i:05d}.png", seg_out)
+
+    # ------- raw segmentation (original labels, same crop) ------------
+    raw_seg_out = np.full((480, 640), 255, dtype=np.uint8)  # init to void
+    raw_seg_out[7:474, 7:632] = label_raw[7:474, 7:632]
+    cv2.imwrite(f"{folder}/seg_raw_{i:05d}.png", raw_seg_out)
 
 
 # ----------------------------------------------------------------------#
@@ -66,7 +72,7 @@ if __name__ == "__main__":
     mat = h5py.File(mat_path, "r")
     depth_raw_all = mat['depths']       # (H,W,N)
     images_all    = mat['images']       # (H,W,3,N)
-    labels_raw_all = mat['labels']      # (H,W,N)
+    labels_raw_all = mat['labels']      # (H,W,N) - raw labels
 
     print(f"Loading train/test split  : {split_path}")
     split = scipy.io.loadmat(split_path)
@@ -74,10 +80,15 @@ if __name__ == "__main__":
     train_images = set(int(x) for x in split["trainNdxs"].squeeze())
     print(f"{len(train_images)} training images, {len(test_images)} test images")
 
+    # --------- LOAD THE 40-CLASS MAPPING! ---
+    print(f"Loading 40-class mapping  : {map40_path}")
+    labels40_mat = scipy.io.loadmat(map40_path)
+    labels40_all = labels40_mat['labels40']  # This should be (H,W,N) with 0-39 values
+    print(f"40-class labels shape: {labels40_all.shape}")
+    print(f"40-class unique values: {np.unique(labels40_all[:,:,0])}")  # Check first image
 
     # scenes are MATLAB cell array of strings
     scenes = ["".join(chr(c[0]) for c in mat[ref][:]) for ref in mat['sceneTypes'][0]]
-
 
     print("Processing images...")
     for i in range(images_all.shape[0]):
@@ -88,5 +99,11 @@ if __name__ == "__main__":
             scenes[i],
             depth_raw_all[i, :, :].T,
             images_all[i, :, :, :].T,
-            labels_raw_all[i, :, :].T,
+            labels_raw_all[i, :, :].T,   # RAW LABELS
+            labels40_all[:, :, i].T,     # 40-CLASS LABELS
         )
+
+    print("Done! Your dataset now contains:")
+    print("  - seg40_*.png: 40-class labels (0-39 + 255 for void)")
+    print("  - seg_raw_*.png: raw labels (original 0-255 values)")
+    print("Use seg40_*.png for standard 40-class training!")

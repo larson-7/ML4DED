@@ -51,12 +51,12 @@ class NYUSDv2SegDataset(SegmentationDataset):
             # masks : (B,H,W)   long  (0‑39, 255=void)
     """
 
-    NUM_CLASS = 40
+    NUM_CLASS = 41
     IGNORE_LABEL = 255
 
     # 40‑class names in the NYU order
     _CLASSES = (
-        'bed', 'books', 'ceil', 'chair', 'floor', 'furn', 'objs', 'paint', 'sofa',
+        'background', 'bed', 'books', 'ceil', 'chair', 'floor', 'furn', 'objs', 'paint', 'sofa',
         'table', 'tv', 'wall', 'window', 'blinds', 'desk', 'shelves', 'door',
         'pillow', 'sink', 'lamp', 'tub', 'stove', 'toilet', 'curtain', 'dresser',
         'fridge', 'tv‑monitor', 'radiator', 'glass', 'whiteboard', 'person',
