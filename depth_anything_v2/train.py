@@ -86,39 +86,15 @@ class Trainer(object):
         self.val_loader = data.DataLoader(dataset=valset, batch_size=args.batch_size,
                                           pin_memory=True)
 
-        # DINOv2 backbone vision encoder
-        self.backbone = DINOv2("vitb")
-        model_weight_path = os.path.join(args.model_weights_dir, "dinov2_vitb14_reg4_pretrain.pth")
-        state_dict = torch.load(model_weight_path, map_location='cpu')
-        # load the weights into the model
-        missing_keys, unexpected_keys = self.backbone.load_state_dict(state_dict, strict=False)
-
-        # print warnings if keys don't match exactly
-        if missing_keys:
-            print("[Warning] Missing keys:", missing_keys)
-        if unexpected_keys:
-            print("[Warning] Unexpected keys:", unexpected_keys)
-
-        self.backbone.to(self.device)
-        self.backbone.eval()
-        # freeze weights for backbone
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-
-        # segmentation head
-        # self.model = Dino2Seg(embed_dim=768,
-        #                       num_classes=len(trainset.classes),
-        #                       hidden_dim=512,
-        #                       patch_size=14,
-        #                       image_height=img_h,
-        #                       image_width=img_w).to(self.device)
-
-        self.model = DPTSegmentationHead(
-            in_channels=768,
+        self.model = Dino2Seg(
+            encoder="vitb",
             num_classes=len(trainset.classes),
             image_height=img_h,
             image_width=img_w,
-            patch_size=14).to(self.device)
+            features=768,
+            out_channels=[256, 512, 1024, 1024],
+            model_weights_dir=args.model_weights_dir,
+        )
 
         self.criterion = nn.CrossEntropyLoss(ignore_index=255)
 
@@ -179,9 +155,7 @@ class Trainer(object):
             target = target.to(self.device)
 
             with torch.no_grad():
-                backbone_features = self.backbone.forward_features(image)
-                encoder_outs = backbone_features["x_norm_patchtokens"]
-                outputs = self.model(encoder_outs)
+                outputs = self.model(image)
             self.metric.update(outputs, target)
             pixAcc, mIoU = self.metric.get()
 
