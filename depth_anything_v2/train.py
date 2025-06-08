@@ -39,7 +39,7 @@ def parse_args():
     # training hyper params
     parser.add_argument('--batch-size', type=int, default=16, metavar='N',
                         help='input batch size for training (default: 8)')
-    parser.add_argument('--epochs', type=int, default=100, metavar='N',
+    parser.add_argument('--epochs', type=int, default=200, metavar='N',
                         help='number of epochs to train (default: 50)')
     parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
                         help='learning rate (default: 1e-4)')
@@ -108,6 +108,8 @@ class Trainer(object):
         iteration = 0
         avg_loss = 0
         for i in range(args.epochs):
+            print("-------------------------------------------------------")
+            print("Training Epoch {}/{}".format(i + 1, args.epochs))
             self.validation(iteration, i)
             self.model.train()
             for images, targets, _ in self.train_loader:
@@ -173,8 +175,8 @@ class Trainer(object):
         print(f"pixel acc: {pixAcc}\nmIoU: {mIoU}")
         writer.add_scalar('validation pixAcc', pixAcc, it)
         writer.add_scalar('validation mIoU', mIoU, it)
-        writer.add_image("gt", _targets, it)
-        writer.add_image("pred", _preds, it)
+        writer.add_image("val_gt", _targets, it)
+        writer.add_image("val_pred", _preds, it)
 
         if new_pred > self.best_pred:
             is_best = True
@@ -191,7 +193,7 @@ def save_checkpoint(model, args, is_best=False):
     filename = f"dinov2_seg.pth"
     filename = os.path.join(directory, filename)
 
-    torch.save(model.state_dict(), filename)
+    torch.save(model.seg_head.state_dict(), filename)
     if is_best:
         best_filename = 'dinov2_seg_best_model.pth'
         best_filename = os.path.join(directory, best_filename)

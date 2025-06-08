@@ -12,61 +12,6 @@ from depth_anything_v2.base import ConvBlock
 from torchvision.transforms import Compose
 from depth_anything_v2.util.transform import Resize, NormalizeImage, PrepareForNet
 
-# class Dino2Seg(nn.Module):
-#     """
-#     tokens ─► Linear ─► ReLU ─► Conv2d ─►  low‑res logits  (no upsample)
-#     --------------------------------------------------------------------
-#     * Use `upsample_logits()` (below) when you want H×W output.
-#     """
-#
-#     def __init__(
-#         self,
-#         embed_dim: int = 768,       # ViT token dim (e.g. 768 for ViT‑B/14)
-#         num_classes: int = 41,      # NYU = 41
-#         hidden_dim: int = 512,      # width after Linear
-#         patch_size: int = 14,       # backbone patch stride
-#         image_height: int = 630,
-#         image_width: int = 476,
-#     ):
-#         super().__init__()
-#         self.patch_size = patch_size
-#         self.mlp  = nn.Linear(embed_dim, hidden_dim)
-#         self.relu = nn.ReLU(inplace=True)
-#         self.conv = ConvBlock(in_feature=hidden_dim, out_feature=num_classes)
-#         self.image_height = image_height
-#         self.image_width = image_width
-#         self.ph = self.image_height // self.patch_size
-#         self.pw = self.image_width // self.patch_size
-#
-#     # ----------------------------------------------------------------- #
-#     @staticmethod
-#     def _tokens_to_map(tokens, ph, pw, c):
-#         """(B, N, C) → (B, C, ph, pw)"""
-#         return tokens.permute(0, 2, 1).reshape(tokens.size(0), c, ph, pw)
-#
-#     # ----------------------------------------------------------------- #
-#     def forward(self, tokens):
-#         """
-#         tokens: (B, N, C) patch embeddings from backbone
-#         returns: (B, num_classes, ph, pw)  where ph = H/patch,  pw = W/patch
-#         """
-#         B, N, _ = tokens.shape
-#
-#         x = self.relu(self.mlp(tokens))        # (B, N, hidden)
-#         x = self._tokens_to_map(x, self.ph, self.pw, x.size(-1))
-#         logits_low = self.conv(x)              # (B, num_cls, ph, pw)
-#         return logits_low
-#
-#
-# # ──────────────────── one‑liner helper for later ───────────────────── #
-# def upsample_logits(logits, target_hw, mode="bilinear"):
-#     """
-#     logits   : (B, C, h, w)   – low‑res output of SimpleSegHead
-#     target_hw: (H, W)         – original image resolution
-#     returns  : (B, C, H, W)   – ready for arg‑max or soft‑viz
-#     """
-#     return F.interpolate(logits, size=target_hw, mode=mode, align_corners=False)
-
 class DPTSegmentationHead(nn.Module):
     def __init__(
         self,
@@ -155,8 +100,8 @@ class Dino2Seg(nn.Module):
             features=768,
             out_channels=[256, 512, 1024, 1024],
             use_bn=False,
-            use_clstoken=False
-,           model_weights_dir="",
+            use_clstoken=False,
+            model_weights_dir="",
             device="cuda",
     ):
         super(Dino2Seg, self).__init__()
@@ -174,33 +119,59 @@ class Dino2Seg(nn.Module):
         self.pretrained = DINOv2(model_name=encoder)
         self.device = device
 
-        # load the weights into the model
-        if model_weights_dir:
-            model_weight_path = os.path.join(model_weights_dir, "dinov2_vitb14_reg4_pretrain.pth")
-            print("loading pretrained weights from {}".format(model_weight_path))
-            state_dict = torch.load(model_weight_path, map_location='cpu')
-            missing_keys, unexpected_keys = self.pretrained.load_state_dict(state_dict, strict=False)
-            # print warnings if keys don't match exactly
-            if missing_keys:
-                print("[Warning] Missing keys:", missing_keys)
-            if unexpected_keys:
-                print("[Warning] Unexpected keys:", unexpected_keys)
+        # ──────────────── WEIGHT LOADING LOGIC ──────────────── #
+        vitb_weight_file = None
+        seg_weight_file = None
 
+        if model_weights_dir and os.path.isdir(model_weights_dir):
+            files = os.listdir(model_weights_dir)
+            # Find backbone
+            for f in files:
+                if "vitb" in f and (f.endswith(".pth") or f.endswith(".pt")):
+                    vitb_weight_file = os.path.join(model_weights_dir, f)
+                if "seg" in f and (f.endswith(".pth") or f.endswith(".pt")):
+                    seg_weight_file = os.path.join(model_weights_dir, f)
+
+        # Load backbone weights if available
+        if vitb_weight_file:
+            print(f"Loading ViT-b backbone weights from: {vitb_weight_file}")
+            state_dict = torch.load(vitb_weight_file, map_location='cpu')
+            missing_keys, unexpected_keys = self.pretrained.load_state_dict(state_dict, strict=False)
+            if missing_keys:
+                print("[Backbone] Missing keys:", missing_keys)
+            if unexpected_keys:
+                print("[Backbone] Unexpected keys:", unexpected_keys)
             self.pretrained.eval()
-            # freeze weights for backbone
             for param in self.pretrained.parameters():
                 param.requires_grad = False
+        else:
+            print("No ViT-b backbone weights found.")
 
+        # Setup segmentation head
         self.seg_head = DPTSegmentationHead(
             in_channels=features,
             num_classes=num_classes,
             out_channels=out_channels,
-            use_bn = use_bn,
-            use_clstoken = use_clstoken,
-        ).to(self.device)
+            use_bn=use_bn,
+            use_clstoken=use_clstoken,
+        )
+
+        # Load segmentation head weights if available
+        if seg_weight_file:
+            print(f"Loading segmentation head weights from: {seg_weight_file}")
+            seg_state_dict = torch.load(seg_weight_file, map_location='cpu')
+            missing_keys, unexpected_keys = self.seg_head.load_state_dict(seg_state_dict, strict=False)
+            # print warnings if keys don't match exactly
+            if missing_keys:
+                print("[Seg Head] Missing keys:", missing_keys)
+            if unexpected_keys:
+                print("[Seg Head] Unexpected keys:", unexpected_keys)
+        else:
+            print("No segmentation head weights found.")
 
         self.pretrained.to(self.device)
         self.seg_head.to(self.device)
+
 
     def forward(self, x):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
