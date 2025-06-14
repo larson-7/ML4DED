@@ -7,7 +7,7 @@ from tqdm import tqdm
 import pycocotools.mask as mask_utils
 import matplotlib.pyplot as plt
 
-DATA_DIR = '/home/jordan/omscs/cs8903/SegDefDepth/data/ml4ded'
+DATA_DIR = '/data/ml4ded'
 MASKS_DIR = os.path.join(DATA_DIR, 'layer_masks')
 VIDEOS_DIR = os.path.join(DATA_DIR, 'layer_videos')
 OUTPUT_IMAGES = os.path.join(DATA_DIR, 'segmentation_images')
@@ -84,14 +84,14 @@ for subdir in sorted(os.listdir(MASKS_DIR)):
     for mask_idx, vframe_idx in tqdm(zip(range(len(mask_frame_indices)), video_indices), total=len(video_indices), desc=f'Processing {subdir}'):
         interp_mask = decoded_masks[mask_idx]
 
-        mask_out_path = os.path.join(OUTPUT_MASKS, f'{subdir}_{vframe_idx:05d}.png')
+        mask_out_path = os.path.join(OUTPUT_MASKS, f'seg_{subdir}_{vframe_idx:05d}.png')
         cv2.imwrite(mask_out_path, interp_mask.astype(np.uint8))
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, vframe_idx)
         ret, frame = cap.read()
         if not ret:
             continue
-        img_out_path = os.path.join(OUTPUT_IMAGES, f'{subdir}_{vframe_idx:05d}.png')
+        img_out_path = os.path.join(OUTPUT_IMAGES, f'rgb_{subdir}_{vframe_idx:05d}.png')
         cv2.imwrite(img_out_path, frame)
 
         if vframe_idx in sample_indices_set:

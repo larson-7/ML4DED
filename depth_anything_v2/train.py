@@ -17,16 +17,18 @@ cur_path = os.path.abspath(os.path.dirname(__file__))
 root_path = os.path.split(cur_path)[0]
 sys.path.append(root_path)
 
-from dino2seg import Dino2Seg, DPTSegmentationHead
+from dino2seg import Dino2Seg
 from util.segmentationMetric import *
 from util.vis import decode_segmap
-from depth_anything_v2.dinov2 import DINOv2
 from util.nyu_d_v2.nyudv2_seg_dataset import NYUSDv2SegDataset
+from util.ml4ded.ml4ded_seg_dataset import ML4DEDSegmentationDataset
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Semantic Segmentation Training With Pytorch')
-    parser.add_argument('--data-dir', type=str, default="../data/nyu_depth_v2",
+    parser.add_argument('--dataset', type=str, default="ml4ded", choices=["nyu", "ml4ded"],
+                        help='Dataset to train on (nyu or ml4ded)')
+    parser.add_argument('--data-dir', type=str, default=None,
                         help='train/test data directory')
     parser.add_argument('--model-weights-dir', type=str, default="../model_weights",
                         help='pretrained model weights directory')
@@ -36,22 +38,15 @@ def parse_args():
     parser.add_argument('--crop-size', type=int, default=518,
                         help='crop image size')
 
-    # training hyper params
     parser.add_argument('--batch-size', type=int, default=16, metavar='N',
-                        help='input batch size for training (default: 8)')
+                        help='input batch size for training')
     parser.add_argument('--epochs', type=int, default=200, metavar='N',
-                        help='number of epochs to train (default: 50)')
+                        help='number of epochs to train')
     parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
-                        help='learning rate (default: 1e-4)')
-
-    # checkpoint and log
-    parser.add_argument('--save-dir', default='./ckpt',
-                        help='Directory for saving checkpoint models')
-
-    parser.add_argument('--device', default='cuda',
-                        help='Training device')
-    args = parser.parse_args()
-    return args
+                        help='learning rate')
+    parser.add_argument('--save-dir', default='./ckpt', help='Directory for saving checkpoint models')
+    parser.add_argument('--device', default='cuda', help='Training device')
+    return parser.parse_args()
 
 
 def make_divisible(val, divisor=14):
@@ -63,8 +58,22 @@ class Trainer(object):
         self.args = args
         self.device = torch.device(args.device)
 
-        # NYUv2: original size is 640×480 → crop to 630×476 for compatibility
-        img_h, img_w = make_divisible(480), make_divisible(640)
+        # -------- Dataset selection logic ---------
+        if args.dataset == "nyu":
+            dataset_class = NYUSDv2SegDataset
+            print("Using NYUv2 dataset")
+            default_data_dir = os.path.join(root_path, "data/nyu_depth_v2")
+            img_h, img_w = make_divisible(480), make_divisible(640)
+        elif args.dataset == "ml4ded":
+            dataset_class = ML4DEDSegmentationDataset
+            print("Using ML4DED dataset")
+            default_data_dir = os.path.join(root_path, "data/ml4ded")
+            # Adapt to your actual image size
+            img_h, img_w = make_divisible(480), make_divisible(640)
+        else:
+            raise ValueError(f"Unknown dataset {args.dataset}")
+
+        data_dir = args.data_dir if args.data_dir else default_data_dir
 
         # image transform (normalize to imagenet mean statistics)
         input_transform = transforms.Compose([
@@ -72,19 +81,18 @@ class Trainer(object):
             transforms.ToTensor(),
             transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
         ])
-
         seg_transform = transforms.Compose([
             transforms.CenterCrop((img_h, img_w)),
             transforms.ToTensor()])
 
         # dataset and dataloader
-        trainset = NYUSDv2SegDataset(args.data_dir, split="train", mode="train", transform=input_transform, seg_transform=seg_transform)
-        valset = NYUSDv2SegDataset(args.data_dir, split="test", mode="val", transform=input_transform, seg_transform=seg_transform)
+        trainset = dataset_class(data_dir, split="train", mode="train", transform=input_transform,
+                                 seg_transform=seg_transform)
+        valset = dataset_class(data_dir, split="test", mode="val", transform=input_transform,
+                               seg_transform=seg_transform)
 
-        self.train_loader = data.DataLoader(dataset=trainset, batch_size=args.batch_size,
-                                            pin_memory=True)
-        self.val_loader = data.DataLoader(dataset=valset, batch_size=args.batch_size,
-                                          pin_memory=True)
+        self.train_loader = data.DataLoader(dataset=trainset, batch_size=args.batch_size, pin_memory=True)
+        self.val_loader = data.DataLoader(dataset=valset, batch_size=args.batch_size, pin_memory=True)
 
         self.model = Dino2Seg(
             encoder="vitb",
@@ -97,10 +105,7 @@ class Trainer(object):
         )
 
         self.criterion = nn.CrossEntropyLoss(ignore_index=255)
-
-        self.optimizer = torch.optim.AdamW(self.model.parameters(),
-                                           lr=args.lr)
-
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr)
         self.metric = SegmentationMetric(len(trainset.classes))
         self.best_pred = -1
 
@@ -113,17 +118,13 @@ class Trainer(object):
             self.validation(iteration, i)
             self.model.train()
             for images, targets, _ in self.train_loader:
-                iteration = iteration + 1
-                # self.lr_scheduler.step()
-
+                iteration += 1
                 images = images.to(self.device)
                 targets = targets.to(self.device)
                 outputs = self.model(images)
                 pred = torch.max(outputs, 1).indices
-
                 loss = self.criterion(outputs, targets.squeeze(1))
                 loss = torch.mean(loss)
-
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
@@ -135,53 +136,43 @@ class Trainer(object):
                     avg_loss = 0
 
                 if iteration % 1000 == 1:
-                    pred = decode_segmap(pred[0].cpu().data.numpy())
-                    gt = decode_segmap(targets[0].squeeze(0).cpu().data.numpy())
-
-                    pred = torch.from_numpy(pred).permute(2, 0, 1)
-                    gt = torch.from_numpy(gt).permute(2, 0, 1)
-                    writer.add_image("pred", pred, iteration)
-                    writer.add_image("gt", gt, iteration)
+                    pred_img = decode_segmap(pred[0].cpu().data.numpy())
+                    gt_img = decode_segmap(targets[0].squeeze(0).cpu().data.numpy())
+                    pred_img = torch.from_numpy(pred_img).permute(2, 0, 1)
+                    gt_img = torch.from_numpy(gt_img).permute(2, 0, 1)
+                    writer.add_image("pred", pred_img, iteration)
+                    writer.add_image("gt", gt_img, iteration)
 
     def validation(self, it, e):
-        # total_inter, total_union, total_correct, total_label = 0, 0, 0, 0
         is_best = False
         torch.cuda.empty_cache()
-
         self.model.eval()
-        _preds = []
-        _targets = []
+        _preds, _targets = [], []
         print("Evaluating")
         for image, target, _ in tqdm(self.val_loader):
             image = image.to(self.device)
             target = target.to(self.device)
             target = target.squeeze(1)
-
             with torch.no_grad():
                 outputs = self.model(image)
             self.metric.update(outputs, target)
             pixAcc, mIoU = self.metric.get()
-
             pred = torch.max(outputs, 1).indices
             for i in range(pred.shape[0]):
                 if len(_preds) < 64:
                     _preds.append(torchvision.transforms.ToTensor()(decode_segmap(pred[i].cpu().data.numpy())))
                     _targets.append(torchvision.transforms.ToTensor()(decode_segmap(target[i].cpu().data.numpy())))
-
         _preds = torchvision.utils.make_grid(_preds, nrow=8)
         _targets = torchvision.utils.make_grid(_targets, nrow=8)
-
         new_pred = (pixAcc + mIoU) / 2
         print(f"pixel acc: {pixAcc}\nmIoU: {mIoU}")
         writer.add_scalar('validation pixAcc', pixAcc, it)
         writer.add_scalar('validation mIoU', mIoU, it)
         writer.add_image("val_gt", _targets, it)
         writer.add_image("val_pred", _preds, it)
-
         if new_pred > self.best_pred:
             is_best = True
             self.best_pred = new_pred
-
         save_checkpoint(self.model, self.args, is_best)
 
 
@@ -192,7 +183,6 @@ def save_checkpoint(model, args, is_best=False):
         os.makedirs(directory)
     filename = f"dinov2_seg.pth"
     filename = os.path.join(directory, filename)
-
     torch.save(model.seg_head.state_dict(), filename)
     if is_best:
         best_filename = 'dinov2_seg_best_model.pth'
@@ -202,9 +192,7 @@ def save_checkpoint(model, args, is_best=False):
 
 if __name__ == '__main__':
     args = parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = '0, 1'
-
-    # reference maskrcnn-benchmark
+    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
     args.device = "cuda"
     writer = SummaryWriter()
     trainer = Trainer(args)
