@@ -128,9 +128,6 @@ class NYUSDv2SegDataset(SegmentationDataset):
     def __len__(self):
         return len(self.files)
 
-    # def _mask_transform(self, mask):
-    #     return torch.from_numpy(np.array(mask, dtype='uint8')).long()
-
     def _mask_transform(self, mask):
         return mask  # PIL if torchvision transform is applied later
 

@@ -28,7 +28,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Semantic Segmentation Training With Pytorch')
     parser.add_argument('--dataset', type=str, default="ml4ded", choices=["nyu", "ml4ded"],
                         help='Dataset to train on (nyu or ml4ded)')
-    parser.add_argument('--data-dir', type=str, default=None,
+    parser.add_argument('--data-dir', type=str, default="../data/ml4ded",
                         help='train/test data directory')
     parser.add_argument('--model-weights-dir', type=str, default="../model_weights",
                         help='pretrained model weights directory')
@@ -38,7 +38,7 @@ def parse_args():
     parser.add_argument('--crop-size', type=int, default=518,
                         help='crop image size')
 
-    parser.add_argument('--batch-size', type=int, default=16, metavar='N',
+    parser.add_argument('--batch-size', type=int, default=8, metavar='N',
                         help='input batch size for training')
     parser.add_argument('--epochs', type=int, default=200, metavar='N',
                         help='number of epochs to train')
@@ -69,7 +69,7 @@ class Trainer(object):
             print("Using ML4DED dataset")
             default_data_dir = os.path.join(root_path, "data/ml4ded")
             # Adapt to your actual image size
-            img_h, img_w = make_divisible(480), make_divisible(640)
+            img_h, img_w = make_divisible(1072), make_divisible(608)
         else:
             raise ValueError(f"Unknown dataset {args.dataset}")
 

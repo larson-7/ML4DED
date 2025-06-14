@@ -2,9 +2,9 @@ import os
 from glob import glob
 from PIL import Image
 import torch
-from torch.utils.data import Dataset
+from depth_anything_v2.util.segbase import SegmentationDataset
 
-class ML4DEDSegmentationDataset(Dataset):
+class ML4DEDSegmentationDataset(SegmentationDataset):
     """
     ML4DED segmentation dataset (official_splits format):
         - Each split ('train', 'test') contains one folder per video.
@@ -17,7 +17,18 @@ class ML4DEDSegmentationDataset(Dataset):
         seg_transform (callable, optional): Transform pipeline for mask images.
         mode (str, optional): 'train' | 'val' | 'testval' (controls augmentation, if you subclass).
     """
+    NUM_CLASS = 6
     IGNORE_LABEL = 255
+
+    # 6‑class names in the ML4DED order
+    _CLASSES = (
+    "background",
+    "head",
+    "baseplate",
+    "previous_weld",
+    "weld",
+    "current_part",
+    )
 
     def __init__(
         self,
@@ -27,7 +38,9 @@ class ML4DEDSegmentationDataset(Dataset):
         seg_transform=None,
         mode='train',
     ):
-        super().__init__()
+        super(ML4DEDSegmentationDataset, self).__init__(
+            root, split, mode, transform
+        )
         self.root = root
         self.split = split
         self.transform = transform
@@ -72,6 +85,17 @@ class ML4DEDSegmentationDataset(Dataset):
 
     def __len__(self):
         return len(self.files)
+
+    def _mask_transform(self, mask):
+        return mask  # PIL if torchvision transform is applied later
+
+    def _img_transform(self, img):
+        return img  # keep as PIL for torchvision
+
+    @property
+    def classes(self):
+        return self._CLASSES
+
 
 
 if __name__ == '__main__':
