@@ -7,7 +7,7 @@ from tqdm import tqdm
 import pycocotools.mask as mask_utils
 import matplotlib.pyplot as plt
 
-DATA_DIR = '/data/ml4ded'
+DATA_DIR = '/home/jordan/omscs/cs8903/SegDefDepth/data/ml4ded'
 MASKS_DIR = os.path.join(DATA_DIR, 'layer_masks')
 VIDEOS_DIR = os.path.join(DATA_DIR, 'layer_videos')
 OUTPUT_IMAGES = os.path.join(DATA_DIR, 'segmentation_images')
