@@ -127,7 +127,7 @@ class Dino2Seg(nn.Module):
             files = os.listdir(model_weights_dir)
             # Find backbone
             for f in files:
-                if "vitb" in f and (f.endswith(".pth") or f.endswith(".pt")):
+                if "depth_anything" in f and (f.endswith(".pth") or f.endswith(".pt")):
                     vitb_weight_file = os.path.join(model_weights_dir, f)
                 if "seg" in f and (f.endswith(".pth") or f.endswith(".pt")):
                     seg_weight_file = os.path.join(model_weights_dir, f)
@@ -136,7 +136,11 @@ class Dino2Seg(nn.Module):
         if vitb_weight_file:
             print(f"Loading ViT-b backbone weights from: {vitb_weight_file}")
             state_dict = torch.load(vitb_weight_file, map_location='cpu')
-            missing_keys, unexpected_keys = self.pretrained.load_state_dict(state_dict, strict=False)
+            adjusted_state_dict = {
+                k.replace('pretrained.', ''): v
+                for k, v in state_dict.items() if k.startswith('pretrained.')
+            }
+            missing_keys, unexpected_keys = self.pretrained.load_state_dict(adjusted_state_dict, strict=False)
             if missing_keys:
                 print("[Backbone] Missing keys:", missing_keys)
             if unexpected_keys:

@@ -18,7 +18,7 @@ class SegmentationDeformableDepth(nn.Module):
     def __init__(
             self,
             encoder='vitb',
-            num_classes=40,
+            num_classes=6,
             image_height=476,
             image_width=630,
             features=768,
@@ -61,9 +61,13 @@ class SegmentationDeformableDepth(nn.Module):
 
         # Load backbone weights if available
         if vitb_weight_file:
-            print(f"Loading ViT-b backbone weights from: {vitb_weight_file}")
-            state_dict = torch.load(vitb_weight_file, map_location='cpu')
-            missing_keys, unexpected_keys = self.pretrained.load_state_dict(state_dict, strict=False)
+            print(f"Loading ViT-b backbone weights from: {depth_weight_file}")
+            state_dict = torch.load(depth_weight_file, map_location='cpu')
+            adjusted_state_dict = {
+                k.replace('pretrained.', ''): v
+                for k, v in state_dict.items() if k.startswith('pretrained.')
+            }
+            missing_keys, unexpected_keys = self.pretrained.load_state_dict(adjusted_state_dict, strict=False)
             if missing_keys:
                 print("[Backbone] Missing keys:", missing_keys)
             if unexpected_keys:
@@ -98,18 +102,24 @@ class SegmentationDeformableDepth(nn.Module):
 
         # Setup depth head
         self.depth_head = DPTHead(
-            self.pretrained.embed_dim,
-            features,
-            use_bn,
-            out_channels=out_channels,
-            use_clstoken=use_clstoken
+            in_channels=768,  # ViT-B output dimension
+            features=128,  # internal refinenet channels
+            use_bn=False,
+            out_channels=[96, 192, 384, 768],  # projections expected by checkpoint
+            use_clstoken=False,
         )
 
         # Load depth head weights if available
         if depth_weight_file:
             print(f"Loading depth head weights from: {depth_weight_file}")
             depth_state_dict = torch.load(depth_weight_file, map_location='cpu')
-            missing_keys, unexpected_keys = self.depth_head.load_state_dict(depth_state_dict, strict=False)
+
+            adjusted_state_dict = {
+                k.replace('depth_head.', ''): v
+                for k, v in depth_state_dict.items() if k.startswith('depth_head.')
+            }
+            missing_keys, unexpected_keys = self.depth_head.load_state_dict(adjusted_state_dict, strict=False)
+
             # print warnings if keys don't match exactly
             if missing_keys:
                 print("[Depth Head] Missing keys:", missing_keys)
