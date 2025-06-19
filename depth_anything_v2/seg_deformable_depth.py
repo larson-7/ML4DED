@@ -6,91 +6,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from depth_anything_v2.dino2seg import DPTSegmentationHead
 from depth_anything_v2.dinov2 import DINOv2
+from depth_anything_v2.dpt import DPTHead
 from depth_anything_v2.util.blocks import FeatureFusionBlock, _make_scratch
 from depth_anything_v2.base import ConvBlock
 from torchvision.transforms import Compose
 from depth_anything_v2.util.transform import Resize, NormalizeImage, PrepareForNet
 
-class DPTSegmentationHead(nn.Module):
-    def __init__(
-        self,
-        in_channels=768,                        # transformer embedding dim
-        features=256,                           # decoder channels
-        out_channels=[256, 512, 1024, 1024],    # for the 4 scale projections
-        num_classes=40,                         # NYUDv2
-        use_bn=False,
-        use_clstoken=False
-    ):
-        super().__init__()
-        self.use_clstoken = use_clstoken
-
-        self.projects = nn.ModuleList([
-            nn.Conv2d(in_channels, out_ch, kernel_size=1)
-            for out_ch in out_channels
-        ])
-        self.resize_layers = nn.ModuleList([
-            nn.ConvTranspose2d(out_channels[0], out_channels[0], kernel_size=4, stride=4),
-            nn.ConvTranspose2d(out_channels[1], out_channels[1], kernel_size=2, stride=2),
-            nn.Identity(),
-            nn.Conv2d(out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1)
-        ])
-
-        if use_clstoken:
-            self.readout_projects = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(2 * in_channels, in_channels),
-                    nn.GELU()
-                ) for _ in range(4)
-            ])
-
-        self.scratch = _make_scratch(out_channels, features, groups=1, expand=False)
-        self.scratch.refinenet1 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
-        self.scratch.refinenet2 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
-        self.scratch.refinenet3 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
-        self.scratch.refinenet4 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
-
-        self.segmentation_head = nn.Sequential(
-            nn.Conv2d(features, features // 2, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(features // 2, num_classes, kernel_size=1)
-        )
-
-    def forward(self, out_features, ph, pw, upsample_hw=None):
-        out = []
-        for i, x in enumerate(out_features):
-            if self.use_clstoken:
-                x, cls_token = x[0], x[1]
-                readout = cls_token.unsqueeze(1).expand_as(x)
-                x = self.readout_projects[i](torch.cat((x, readout), -1))
-            else:
-                x = x[0]   # (B, N, C)
-
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], ph, pw))
-            x = self.projects[i](x)
-            x = self.resize_layers[i](x)
-            out.append(x)
-
-        layer_1, layer_2, layer_3, layer_4 = out
-
-        layer_1_rn = self.scratch.layer1_rn(layer_1)
-        layer_2_rn = self.scratch.layer2_rn(layer_2)
-        layer_3_rn = self.scratch.layer3_rn(layer_3)
-        layer_4_rn = self.scratch.layer4_rn(layer_4)
-
-        path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
-        path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
-        path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
-        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
-
-        seg = self.segmentation_head(path_1)
-        # Upsample to target resolution if given (for full-res logits)
-        if upsample_hw is not None:
-            seg = F.interpolate(seg, upsample_hw, mode="bilinear", align_corners=True)
-        return seg  # (B, num_classes, H, W)
-
-
-class Dino2Seg(nn.Module):
+class SegmentationDeformableDepth(nn.Module):
     def __init__(
             self,
             encoder='vitb',
@@ -104,7 +28,7 @@ class Dino2Seg(nn.Module):
             model_weights_dir="",
             device="cuda",
     ):
-        super(Dino2Seg, self).__init__()
+        super(SegmentationDeformableDepth, self).__init__()
 
         self.intermediate_layer_idx = {
             'vits': [2, 5, 8, 11],
@@ -122,6 +46,7 @@ class Dino2Seg(nn.Module):
         # ──────────────── WEIGHT LOADING LOGIC ──────────────── #
         vitb_weight_file = None
         seg_weight_file = None
+        depth_weight_file = None
 
         if model_weights_dir and os.path.isdir(model_weights_dir):
             files = os.listdir(model_weights_dir)
@@ -131,6 +56,8 @@ class Dino2Seg(nn.Module):
                     vitb_weight_file = os.path.join(model_weights_dir, f)
                 if "seg" in f and (f.endswith(".pth") or f.endswith(".pt")):
                     seg_weight_file = os.path.join(model_weights_dir, f)
+                if "depth" in f and (f.endswith(".pth") or f.endswith(".pt")):
+                    depth_weight_file = os.path.join(model_weights_dir, f)
 
         # Load backbone weights if available
         if vitb_weight_file:
@@ -169,8 +96,31 @@ class Dino2Seg(nn.Module):
         else:
             print("No segmentation head weights found.")
 
+        # Setup depth head
+        self.depth_head = DPTHead(
+            self.pretrained.embed_dim,
+            features,
+            use_bn,
+            out_channels=out_channels,
+            use_clstoken=use_clstoken
+        )
+
+        # Load depth head weights if available
+        if depth_weight_file:
+            print(f"Loading depth head weights from: {depth_weight_file}")
+            depth_state_dict = torch.load(depth_weight_file, map_location='cpu')
+            missing_keys, unexpected_keys = self.depth_head.load_state_dict(depth_state_dict, strict=False)
+            # print warnings if keys don't match exactly
+            if missing_keys:
+                print("[Depth Head] Missing keys:", missing_keys)
+            if unexpected_keys:
+                print("[Depth Head] Unexpected keys:", unexpected_keys)
+        else:
+            print("No depth head weights found.")
+
         self.pretrained.to(self.device)
         self.seg_head.to(self.device)
+        self.depth_head.to(self.device)
 
 
     def forward(self, x):
@@ -179,20 +129,28 @@ class Dino2Seg(nn.Module):
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder],
                                                            return_class_token=True)
 
-        segmentation = self.seg_head(out_features=features, ph=patch_h, pw=patch_w, upsample_hw = (self.image_height, self.image_width))
+        segmentation = self.seg_head(
+            out_features=features,
+            ph=patch_h,
+            pw=patch_w,
+            upsample_hw=(self.image_height, self.image_width)
+        )
         segmentation = F.relu(segmentation)
 
-        return segmentation.squeeze(1)
+        depth = self.depth_head(features, patch_h, patch_w)
+        depth = F.relu(depth)
+
+        return segmentation.squeeze(1), depth.squeeze(1)
 
     @torch.no_grad()
     def infer_image(self, raw_image, input_size=518):
         image, (h, w) = self.image2tensor(raw_image, input_size)
 
-        segmentation = self.forward(image)
+        segmentation, depth = self.forward(image)
 
-        segmentation = F.interpolate(segmentation[:, None], (h, w), mode="bilinear", align_corners=True)[0, 0]
+        depth = F.interpolate(depth[:, None], (h, w), mode="bilinear", align_corners=True)[0, 0]
 
-        return segmentation.cpu().numpy()
+        return depth.cpu().numpy()
 
     def image2tensor(self, raw_image, input_size=518):
         transform = Compose([
