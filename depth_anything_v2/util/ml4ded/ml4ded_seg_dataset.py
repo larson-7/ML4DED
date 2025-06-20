@@ -2,6 +2,7 @@ import os
 from glob import glob
 from PIL import Image
 import torch
+import numpy as np
 from depth_anything_v2.util.segbase import SegmentationDataset
 
 class ML4DEDSegmentationDataset(SegmentationDataset):
@@ -69,18 +70,19 @@ class ML4DEDSegmentationDataset(SegmentationDataset):
     def __getitem__(self, index):
         rgb_path, mask_path, idx = self.files[index]
 
-        img = Image.open(rgb_path).convert('RGB')
-        mask = Image.open(mask_path)  # 'L', uint8
+        img = np.array(Image.open(rgb_path).convert('RGB'))  # Convert to numpy array
+        mask_img = Image.open(mask_path)
 
-        # Optionally apply transforms (see SegmentationDataset logic in your codebase)
+        if mask_img.size != (img.shape[1], img.shape[0]):
+            mask_img = mask_img.resize((img.shape[1], img.shape[0]), resample=Image.NEAREST)
+        mask = np.array(mask_img)
+
         if self.transform is not None:
-            img = self.transform(img)
-        if self.seg_transform is not None:
-            mask = self.seg_transform(mask)
-            # ToTensor rescales to [0,1]; restore 0-255 and long dtype for mask
-            if isinstance(mask, torch.Tensor):
-                mask = (mask * 255).long()
-
+            augmented = self.transform(image=img, mask=mask)
+            img = augmented['image']
+            mask = augmented['mask']
+        
+        mask = mask.long()
         return img, mask, idx
 
     def __len__(self):

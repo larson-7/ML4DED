@@ -1,3 +1,5 @@
 /data
 /model_weights
-/runs
+/depth_anything_v2/runs
+**__pycache__/
+/depth_anything_v2/ckpt

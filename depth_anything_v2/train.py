@@ -22,6 +22,8 @@ from util.segmentationMetric import *
 from util.vis import decode_segmap
 from util.nyu_d_v2.nyudv2_seg_dataset import NYUSDv2SegDataset
 from util.ml4ded.ml4ded_seg_dataset import ML4DEDSegmentationDataset
+from util.early_stopping import EarlyStopping
+from util.augmentations import get_train_augmentation, get_val_augmentation
 
 
 def parse_args():
@@ -38,7 +40,7 @@ def parse_args():
     parser.add_argument('--crop-size', type=int, default=518,
                         help='crop image size')
 
-    parser.add_argument('--batch-size', type=int, default=8, metavar='N',
+    parser.add_argument('--batch-size', type=int, default=6, metavar='N',
                         help='input batch size for training')
     parser.add_argument('--epochs', type=int, default=100, metavar='N',
                         help='number of epochs to train')
@@ -57,7 +59,7 @@ class Trainer(object):
     def __init__(self, args):
         self.args = args
         self.device = torch.device(args.device)
-
+        self.early_stopper = EarlyStopping(patience=10, delta=0.01, verbose=True)
         # -------- Dataset selection logic ---------
         if args.dataset == "nyu":
             dataset_class = NYUSDv2SegDataset
@@ -76,21 +78,13 @@ class Trainer(object):
         data_dir = args.data_dir if args.data_dir else default_data_dir
 
         # image transform (normalize to imagenet mean statistics)
-        input_transform = transforms.Compose([
-            transforms.CenterCrop((img_h, img_w)),
-            transforms.ToTensor(),
-            transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
-        ])
-        seg_transform = transforms.Compose([
-            transforms.CenterCrop((img_h, img_w)),
-            transforms.ToTensor()])
+        train_transform = get_train_augmentation(img_h, img_w)
+        val_transform = get_val_augmentation(img_h, img_w)
 
         # dataset and dataloader
-        trainset = dataset_class(data_dir, split="train", mode="train", transform=input_transform,
-                                 seg_transform=seg_transform)
-        valset = dataset_class(data_dir, split="test", mode="val", transform=input_transform,
-                               seg_transform=seg_transform)
-
+        trainset = dataset_class(data_dir, split="train", mode="train", transform=train_transform)
+        valset = dataset_class(data_dir, split="test", mode="val", transform=val_transform)
+        
         self.train_loader = data.DataLoader(dataset=trainset, batch_size=args.batch_size, pin_memory=True)
         self.val_loader = data.DataLoader(dataset=valset, batch_size=args.batch_size, pin_memory=True)
 
@@ -115,9 +109,15 @@ class Trainer(object):
         for i in range(args.epochs):
             print("-------------------------------------------------------")
             print("Training Epoch {}/{}".format(i + 1, args.epochs))
-            self.validation(iteration, i)
+            val_metric = self.validation(iteration, i)
+
+            self.early_stopper(val_metric)
+            if self.early_stopper.early_stop:
+                print(f"Early stopping at epoch {i+1}")
+                break
+
             self.model.train()
-            for images, targets, _ in self.train_loader:
+            for images, targets, _ in tqdm(self.train_loader):
                 iteration += 1
                 images = images.to(self.device)
                 targets = targets.to(self.device)
