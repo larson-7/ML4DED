@@ -125,11 +125,11 @@ class Trainer(object):
                 avg_loss += loss
 
                 if iteration % 100 == 0:
-                    print(f"e {i} |{iteration} it: {avg_loss.item() / 100}")
+                    print(f"epoch {i} |{iteration} it: {avg_loss.item() / 100: .4f}")
                     writer.add_scalar('training loss', avg_loss.item() / 100, iteration)
                     avg_loss = 0
 
-                if iteration % 1000 == 1:
+                if iteration % 500 == 1:
                     pred_img = decode_segmap(pred[0].cpu().data.numpy())
                     gt_img = decode_segmap(targets[0].squeeze(0).cpu().data.numpy())
                     pred_img = torch.from_numpy(pred_img).permute(2, 0, 1)
@@ -154,14 +154,14 @@ class Trainer(object):
             image = image.to(self.device)
             target = target.to(self.device)
             target = target.squeeze(1)
-            with torch.no_grad():
-                outputs = self.model(image)
+
+            outputs, pred = self.model.infer_image(image)
             self.metric.update(outputs, target)
             pixAcc, mIoU = self.metric.get()
-            pred = torch.max(outputs, 1).indices
+
             for i in range(pred.shape[0]):
                 if len(_preds) < 64:
-                    _preds.append(torchvision.transforms.ToTensor()(decode_segmap(pred[i].cpu().data.numpy())))
+                    _preds.append(torchvision.transforms.ToTensor()(decode_segmap(pred[i])))
                     _targets.append(torchvision.transforms.ToTensor()(decode_segmap(target[i].cpu().data.numpy())))
         _preds = torchvision.utils.make_grid(_preds, nrow=8)
         _targets = torchvision.utils.make_grid(_targets, nrow=8)

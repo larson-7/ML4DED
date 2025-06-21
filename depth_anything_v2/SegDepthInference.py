@@ -12,6 +12,7 @@ from scipy.stats import spearmanr
 
 from depth_anything_v2.seg_deformable_depth import SegmentationDeformableDepth
 from util.vis import decode_segmap
+from time import time
 
 
 cur_path = os.path.abspath(os.path.dirname(__file__))
@@ -20,7 +21,7 @@ sys.path.append(root_path)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Semantic Segmentation and Depth Inference')
-    parser.add_argument('--data-dir', type=str, default="../data/nyu_depth_v2",
+    parser.add_argument('--data-dir', type=str, default="../data/ml4ded/official_splits",
                         help='train/test data directory')
     parser.add_argument('--model-weights-dir', type=str, default="../model_weights",
                         help='pretrained model weights directory')
@@ -64,15 +65,15 @@ if __name__ == '__main__':
         transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
     ])
     transformed_image = input_transform(raw_img).unsqueeze(0).to(args.device)
-    with torch.no_grad():
-        seg, depth = model(transformed_image)
-
+    start_time = time()
+    depth, seg_map = model.infer_image(transformed_image)
+    end_time = time()
+    print(f"SegDepthInference took {end_time - start_time} seconds")
     # Process segmentation output
-    pred_labels = torch.max(seg, 1).indices
-    seg_map = decode_segmap(pred_labels[0].detach().cpu().numpy())  # (H, W, 3)
+    seg_map_color = decode_segmap(seg_map[0])  # (H, W, 3)
 
     # Process depth output
-    depth_map = depth[0].detach().cpu().numpy()
+    depth_map = depth[0]
     depth_map_norm = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-8)
     depth_map_inv = 1.0 - depth_map_norm
     depth_map_vis = cv2.applyColorMap((depth_map_inv * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
@@ -82,7 +83,7 @@ if __name__ == '__main__':
     axs[0].imshow(raw_img)
     axs[0].set_title('Original Image')
     axs[0].axis('off')
-    axs[1].imshow(seg_map)
+    axs[1].imshow(seg_map_color)
     axs[1].set_title('Predicted Segmentation')
     axs[1].axis('off')
     axs[2].imshow(depth_map_vis)
@@ -92,43 +93,40 @@ if __name__ == '__main__':
     plt.show()
 
     # ---- Metrics ----
-    pred_seg = pred_labels[0].cpu().numpy()
-    depth_np = depth[0].cpu().numpy()
-
-    class_ids = np.unique(pred_seg)
+    class_ids = np.unique(seg_map)
     print("\n--- Depth Metrics Per Class ---")
     for cls_id in class_ids:
-        mask = (pred_seg == cls_id)
+        mask = (seg_map == cls_id)
         if mask.sum() < 10:
             continue
-        class_depths = depth_np[mask]
+        class_depths = depth[mask]
         mean_depth = np.mean(class_depths)
         std_depth = np.std(class_depths)
         print(f"Class {cls_id}: mean depth = {mean_depth:.4f}, std = {std_depth:.4f}")
 
         # Rank correlation
-        y_coords, x_coords = np.where(mask)
-        flat_positions = x_coords + y_coords * depth_np.shape[1]
+        y_coords, x_coords = np.where(mask[0])
+        flat_positions = x_coords + y_coords * depth.shape[1]
         rho, _ = spearmanr(flat_positions, class_depths.flatten())
         print(f"   Spearman rank correlation ρ = {rho:.3f}")
 
     # --- Relative Depth: Class B vs Class A ---
     class_A = args.class_a
     class_B = args.class_b
-    mask_A = (pred_seg == class_A)
-    mask_B = (pred_seg == class_B)
+    mask_A = (seg_map == class_A)
+    mask_B = (seg_map == class_B)
 
     if np.any(mask_A) and np.any(mask_B):
-        coords_A = np.column_stack(np.where(mask_A))
-        coords_B = np.column_stack(np.where(mask_B))
+        coords_A = np.column_stack(np.where(mask_A[0]))
+        coords_B = np.column_stack(np.where(mask_B[0]))
         min_diffs = []
 
         for ax, ay in coords_A:
             dists = np.linalg.norm(coords_B - np.array([ax, ay]), axis=1)
             idx_closest = np.argmin(dists)
             bx, by = coords_B[idx_closest]
-            d_A = depth_np[ax, ay]
-            d_B = depth_np[bx, by]
+            d_A = depth[0, ax, ay]
+            d_B = depth[0, bx, by]
             min_diffs.append(d_B - d_A)
 
         if len(min_diffs) > 0:

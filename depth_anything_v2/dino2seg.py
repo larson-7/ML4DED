@@ -14,13 +14,13 @@ from depth_anything_v2.util.transform import Resize, NormalizeImage, PrepareForN
 
 class DPTSegmentationHead(nn.Module):
     def __init__(
-        self,
-        in_channels=768,                        # transformer embedding dim
-        features=256,                           # decoder channels
-        out_channels=[256, 512, 1024, 1024],    # for the 4 scale projections
-        num_classes=40,                         # NYUDv2
-        use_bn=False,
-        use_clstoken=False
+            self,
+            in_channels=768,  # transformer embedding dim
+            features=256,  # decoder channels
+            out_channels=[256, 512, 1024, 1024],  # for the 4 scale projections
+            num_classes=40,  # NYUDv2
+            use_bn=False,
+            use_clstoken=False
     ):
         super().__init__()
         self.use_clstoken = use_clstoken
@@ -50,13 +50,23 @@ class DPTSegmentationHead(nn.Module):
         self.scratch.refinenet3 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
         self.scratch.refinenet4 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
 
-        self.segmentation_head = nn.Sequential(
-            nn.Conv2d(features, features // 2, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(features // 2, num_classes, kernel_size=1)
+        head_features_1 = features
+        head_features_2 = 32
+
+        # reduce channels
+        self.scratch.output_conv1 = nn.Conv2d(
+            head_features_1, head_features_1 // 2,
+            kernel_size=3, stride=1, padding=1
         )
 
-    def forward(self, out_features, ph, pw, upsample_hw=None):
+        # final segmentation prediction
+        self.scratch.output_conv2 = nn.Sequential(
+            nn.Conv2d(head_features_1 // 2, head_features_2, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(head_features_2, num_classes, kernel_size=1, stride=1, padding=0),
+        )
+
+    def forward(self, out_features, ph, pw):
         out = []
         for i, x in enumerate(out_features):
             if self.use_clstoken:
@@ -64,7 +74,7 @@ class DPTSegmentationHead(nn.Module):
                 readout = cls_token.unsqueeze(1).expand_as(x)
                 x = self.readout_projects[i](torch.cat((x, readout), -1))
             else:
-                x = x[0]   # (B, N, C)
+                x = x[0]  # (B, N, C)
 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], ph, pw))
             x = self.projects[i](x)
@@ -83,11 +93,11 @@ class DPTSegmentationHead(nn.Module):
         path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
 
-        seg = self.segmentation_head(path_1)
-        # Upsample to target resolution if given (for full-res logits)
-        if upsample_hw is not None:
-            seg = F.interpolate(seg, upsample_hw, mode="bilinear", align_corners=True)
-        return seg  # (B, num_classes, H, W)
+        out = self.scratch.output_conv1(path_1)
+        out = F.interpolate(out, (int(ph * 14), int(pw * 14)), mode="bilinear", align_corners=True)
+        out = self.scratch.output_conv2(out)
+
+        return out  # raw logits (B, num_classes, H, W)
 
 
 class Dino2Seg(nn.Module):
@@ -183,44 +193,45 @@ class Dino2Seg(nn.Module):
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder],
                                                            return_class_token=True)
 
-        segmentation = self.seg_head(out_features=features, ph=patch_h, pw=patch_w, upsample_hw = (self.image_height, self.image_width))
-        segmentation = F.relu(segmentation)
+        seg_logits = self.seg_head(
+            out_features=features,
+            ph=patch_h,
+            pw=patch_w
+        )
 
-        return segmentation.squeeze(1)
+        return seg_logits.squeeze(1)
 
     @torch.no_grad()
-    def infer_image(self, raw_image, input_size=518):
-        image, (h, w) = self.image2tensor(raw_image, input_size)
+    def infer_image(self, image):
+        seg_logits = self.forward(image)
+        seg_probs = F.softmax(seg_logits, dim=1)
+        segmentation_pred = torch.argmax(seg_probs, dim=1)
 
-        segmentation = self.forward(image)
+        return seg_probs, segmentation_pred.cpu().numpy()
 
-        segmentation = F.interpolate(segmentation[:, None], (h, w), mode="bilinear", align_corners=True)[0, 0]
-
-        return segmentation.cpu().numpy()
-
-    def image2tensor(self, raw_image, input_size=518):
-        transform = Compose([
-            Resize(
-                width=input_size,
-                height=input_size,
-                resize_target=False,
-                keep_aspect_ratio=True,
-                ensure_multiple_of=14,
-                resize_method='lower_bound',
-                image_interpolation_method=cv2.INTER_CUBIC,
-            ),
-            NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            PrepareForNet(),
-        ])
-
-        h, w = raw_image.shape[:2]
-
-        image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB) / 255.0
-
-        image = transform({'image': image})['image']
-        image = torch.from_numpy(image).unsqueeze(0)
-
-        DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-        image = image.to(DEVICE)
-
-        return image, (h, w)
+    # def image2tensor(self, raw_image, input_size=518):
+    #     transform = Compose([
+    #         Resize(
+    #             width=input_size,
+    #             height=input_size,
+    #             resize_target=False,
+    #             keep_aspect_ratio=True,
+    #             ensure_multiple_of=14,
+    #             resize_method='lower_bound',
+    #             image_interpolation_method=cv2.INTER_CUBIC,
+    #         ),
+    #         NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    #         PrepareForNet(),
+    #     ])
+    #
+    #     h, w = raw_image.shape[:2]
+    #
+    #     image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB) / 255.0
+    #
+    #     image = transform({'image': image})['image']
+    #     image = torch.from_numpy(image).unsqueeze(0)
+    #
+    #     DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+    #     image = image.to(DEVICE)
+    #
+    #     return image, (h, w)

@@ -39,11 +39,7 @@ class SegmentationMetric(object):
             self.total_inter += inter
             self.total_union += union
 
-        if isinstance(preds, torch.Tensor):
-            evaluate_worker(self, preds, labels.squeeze(1))
-        elif isinstance(preds, (list, tuple)):
-            for (pred, label) in zip(preds, labels):
-                evaluate_worker(self, pred, label.squeeze(1))
+        evaluate_worker(self, preds, labels.squeeze(1))
 
     def get(self):
         """Gets the current evaluation result.

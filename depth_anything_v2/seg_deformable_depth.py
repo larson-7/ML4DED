@@ -1,18 +1,16 @@
-import math
 import os
-
-import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import cv2
 
 from depth_anything_v2.dino2seg import DPTSegmentationHead
-from depth_anything_v2.dinov2 import DINOv2
 from depth_anything_v2.dpt import DPTHead
-from depth_anything_v2.util.blocks import FeatureFusionBlock, _make_scratch
-from depth_anything_v2.base import ConvBlock
 from torchvision.transforms import Compose
-from depth_anything_v2.util.transform import Resize, NormalizeImage, PrepareForNet
+
+from .dinov2 import DINOv2
+from .util.transform import Resize, NormalizeImage, PrepareForNet
+from .util.blocks import FeatureFusionBlock, _make_scratch
 
 class SegmentationDeformableDepth(nn.Module):
     def __init__(
@@ -139,28 +137,25 @@ class SegmentationDeformableDepth(nn.Module):
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder],
                                                            return_class_token=True)
 
-        segmentation = self.seg_head(
-            out_features=features,
-            ph=patch_h,
-            pw=patch_w,
-            upsample_hw=(self.image_height, self.image_width)
-        )
-        segmentation = F.relu(segmentation)
-
         depth = self.depth_head(features, patch_h, patch_w)
         depth = F.relu(depth)
 
-        return segmentation.squeeze(1), depth.squeeze(1)
+        seg_logits = self.seg_head(
+            out_features=features,
+            ph=patch_h,
+            pw=patch_w
+        )
+
+        return depth.squeeze(1), seg_logits.squeeze(1)
 
     @torch.no_grad()
-    def infer_image(self, raw_image, input_size=518):
-        image, (h, w) = self.image2tensor(raw_image, input_size)
+    def infer_image(self, image):
+        depth, seg_logits = self.forward(image)
 
-        segmentation, depth = self.forward(image)
+        seg_probs = F.softmax(seg_logits, dim=1)
+        segmentation_pred = torch.argmax(seg_probs, dim=1)
 
-        depth = F.interpolate(depth[:, None], (h, w), mode="bilinear", align_corners=True)[0, 0]
-
-        return depth.cpu().numpy()
+        return depth.cpu().numpy(), segmentation_pred.cpu().numpy()
 
     def image2tensor(self, raw_image, input_size=518):
         transform = Compose([
