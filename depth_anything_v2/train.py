@@ -109,12 +109,6 @@ class Trainer(object):
         for i in range(args.epochs):
             print("-------------------------------------------------------")
             print("Training Epoch {}/{}".format(i + 1, args.epochs))
-            val_metric = self.validation(iteration, i)
-
-            self.early_stopper(val_metric)
-            if self.early_stopper.early_stop:
-                print(f"Early stopping at epoch {i+1}")
-                break
 
             self.model.train()
             for images, targets, _ in tqdm(self.train_loader):
@@ -142,6 +136,13 @@ class Trainer(object):
                     gt_img = torch.from_numpy(gt_img).permute(2, 0, 1)
                     writer.add_image("pred", pred_img, iteration)
                     writer.add_image("gt", gt_img, iteration)
+            
+            val_metric = self.validation(iteration, i)
+
+            self.early_stopper(val_metric)
+            if self.early_stopper.early_stop:
+                print(f"Early stopping at epoch {i+1}")
+                break
 
     def validation(self, it, e):
         is_best = False
