@@ -12,6 +12,7 @@ from time import time
 
 import open3d as o3d
 
+from depth_anything_v2.depth_metrics import comprehensive_depth_evaluation
 from depth_anything_v2.seg_deformable_depth import SegmentationDeformableDepth
 from util.vis import decode_segmap
 
@@ -29,10 +30,10 @@ def parse_args():
     parser.add_argument('--image-path', type=str, required=True, help='Path to input image')
     parser.add_argument('--model-weights-dir', type=str, default="../model_weights",
                         help='pretrained model weights directory')
-    parser.add_argument('--class-a', type=int, default=SegLabels.HEAD.value, help='Class A ID for relative depth comparison')
-    parser.add_argument('--class-b', type=int, default=SegLabels.BASEPLATE.value, help='Class B ID for relative depth comparison')
-    parser.add_argument('--rim-width', type=int, default=200, help='Ring width (pixels) around part for depth contrast')
-    parser.add_argument('--interactive', action='store_true', default=True, help='Show interactive 3D pointcloud viewer (Open3D)')
+    parser.add_argument('--class-a', type=int, default=SegLabels.BASEPLATE.value, help='Class A ID for relative depth comparison')
+    parser.add_argument('--class-b', type=int, default=SegLabels.CURRENT_PART.value, help='Class B ID for relative depth comparison')
+    parser.add_argument('--rim-width', type=int, default=20, help='Ring width (pixels) around part for depth contrast')
+    parser.add_argument('--interactive', action='store_true', default=False, help='Show interactive 3D pointcloud viewer (Open3D)')
     return parser.parse_args()
 
 def make_divisible(val, divisor=14):
@@ -85,41 +86,61 @@ def estimate_camera_intrinsics(img_width, img_height, fov_degrees=60):
 
     return fx, fy, cx, cy
 
-def capture_pointcloud_image_with_rim(
-    rgb_img, depth_mapS, seg_map, class_id, rim_mask, max_points=100000, rim_points=50000, img_size=600
+
+def set_consistent_view(vis_control):
+    """Set a consistent view for both renderers"""
+    vis_control.set_up([0, -1.0, 0])  # Y is downwards
+    vis_control.set_front([0.5, 0.5, -1.0])  # View direction
+    vis_control.set_lookat([0, 0, 0])  # Look at origin
+    vis_control.set_zoom(0.8)  # Zoom level
+
+
+def capture_pointcloud_image_with_rim_fixed(
+        rgb_img, depth_map, seg_map, class_id, rim_mask, max_points=100000, rim_points=50000, img_size=600
 ):
     """
-    Renders the 3D pointcloud as an image using Open3D's offscreen renderer.
-    Adds the rim_mask points in a contrasting color (cyan).
-    Returns a numpy array (H, W, 3), uint8.
+    Renders the 3D pointcloud as an image using Open3D's offscreen renderer with proper 3D coordinates.
+    Returns the rendered image and the camera view parameters for consistency.
     """
     mask = seg_map == class_id
     if not np.any(mask):
         print(f"No pixels found for class {class_id}")
         return np.zeros((img_size, img_size, 3), dtype=np.uint8)
 
+    # Get image dimensions
+    img_height, img_width = depth_map.shape
+
+    # Estimate camera intrinsics
+    fx, fy, cx, cy = estimate_camera_intrinsics(img_width, img_height)
+
+    # Get pixel coordinates and depths for the main object
     ys, xs = np.where(mask)
     zs = depth_map[mask]
     img_arr = np.array(rgb_img)
     colors = img_arr[mask].astype(np.float32) / 255.0
 
-    # Subsample for clarity/performance
+    # Subsample for performance
     if len(xs) > max_points:
         idx = np.random.choice(len(xs), max_points, replace=False)
         xs, ys, zs, colors = xs[idx], ys[idx], zs[idx], colors[idx]
-    part_points = np.stack([xs, ys, zs], axis=1).astype(np.float32)
 
-    # RIM: Use a contrasting color (cyan)
+    # Convert to 3D coordinates
+    part_points = pixel_to_3d_coordinates(xs, ys, zs, fx, fy, cx, cy)
+
+    # Handle rim points
     rim_ys, rim_xs = np.where(rim_mask)
     rim_zs = depth_map[rim_mask]
-    rim_colors = img_arr[rim_mask].astype(np.float32) / 255.0  # shape (N,3)
+    rim_colors = img_arr[rim_mask].astype(np.float32) / 255.0
     cyan = np.array([0.0, 1.0, 1.0], dtype=np.float32)
-    alpha = 0.3  # how much "cyan" (1.0 = fully cyan, 0.0 = fully original)
+    alpha = 0.3
     rim_colors = alpha * cyan + (1 - alpha) * rim_colors
+
     if len(rim_xs) > rim_points:
         idx = np.random.choice(len(rim_xs), rim_points, replace=False)
         rim_xs, rim_ys, rim_zs, rim_colors = rim_xs[idx], rim_ys[idx], rim_zs[idx], rim_colors[idx]
-    rim_points_xyz = np.stack([rim_xs, rim_ys, rim_zs], axis=1).astype(np.float32)
+
+    # Convert rim points to 3D coordinates
+    rim_points_xyz = pixel_to_3d_coordinates(rim_xs, rim_ys, rim_zs, fx, fy, cx, cy)
 
     # Center and scale (combine both clouds before scaling)
     all_points = np.concatenate([part_points, rim_points_xyz], axis=0)
@@ -150,19 +171,89 @@ def capture_pointcloud_image_with_rim(
     vis.add_geometry(pcd_rim)
 
     ctr = vis.get_view_control()
-    ctr.set_up([0, -1.0, 0])  # Y is downwards, but now "up" in Open3D
-    ctr.set_front([0.5, 0.5, -1.0])
-    ctr.set_lookat([0, 0, 0])
-    ctr.set_zoom(0.7)
+    set_consistent_view(ctr)
 
     vis.update_geometry(pcd_part)
     vis.update_geometry(pcd_rim)
     vis.poll_events()
     vis.update_renderer()
     img = vis.capture_screen_float_buffer(do_render=True)
+    # Get camera parameters for later use
+    camera_params = ctr.convert_to_pinhole_camera_parameters()
+
     vis.destroy_window()
     img = (255 * np.asarray(img)).astype(np.uint8)
-    return img
+    return img, camera_params
+
+
+# Also fix the interactive visualization section
+def create_interactive_pointcloud_fixed(cropped_raw_img, depth_map, seg_map, rim_mask, class_b, SegLabels,
+                                        camera_params=None):
+    """
+    Create interactive 3D point cloud with proper coordinate transformation.
+    If camera_params is provided, use the same view as the offscreen renderer.
+    """
+    mask = seg_map == class_b
+    img_height, img_width = depth_map.shape
+    fx, fy, cx, cy = estimate_camera_intrinsics(img_width, img_height)
+
+    img_arr = np.array(cropped_raw_img)
+    ys, xs = np.where(mask)
+    zs = depth_map[mask]
+    colors = img_arr[mask].astype(np.float32) / 255.0
+
+    # Convert to 3D coordinates
+    part_points = pixel_to_3d_coordinates(xs, ys, zs, fx, fy, cx, cy)
+
+    # Handle rim points
+    rim_ys, rim_xs = np.where(rim_mask)
+    rim_zs = depth_map[rim_mask]
+    rim_colors = img_arr[rim_mask].astype(np.float32) / 255.0
+    cyan = np.array([0.0, 1.0, 1.0], dtype=np.float32)
+    alpha = 0.3
+    rim_colors = alpha * cyan + (1 - alpha) * rim_colors
+
+    # Convert rim points to 3D coordinates
+    rim_points_xyz = pixel_to_3d_coordinates(rim_xs, rim_ys, rim_zs, fx, fy, cx, cy)
+
+    # Center and scale
+    all_points = np.concatenate([part_points, rim_points_xyz], axis=0)
+    centroid = np.mean(all_points, axis=0)
+    all_points -= centroid
+    scale = np.max(np.linalg.norm(all_points, axis=1))
+    all_points /= (scale + 1e-6)
+    all_points *= 600 * 0.4
+
+    n_part = part_points.shape[0]
+    part_points_scaled = all_points[:n_part]
+    rim_points_scaled = all_points[n_part:]
+
+    pcd_part = o3d.geometry.PointCloud()
+    pcd_part.points = o3d.utility.Vector3dVector(part_points_scaled)
+    pcd_part.colors = o3d.utility.Vector3dVector(colors)
+
+    pcd_rim = o3d.geometry.PointCloud()
+    pcd_rim.points = o3d.utility.Vector3dVector(rim_points_scaled)
+    pcd_rim.colors = o3d.utility.Vector3dVector(rim_colors)
+
+    # Create interactive visualization
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name=f"Interactive 3D Pointcloud (class {SegLabels(class_b).name})")
+    vis.add_geometry(pcd_part)
+    vis.add_geometry(pcd_rim)
+
+    # Set the same camera view as the offscreen renderer if provided
+    if camera_params is not None:
+        ctr = vis.get_view_control()
+        ctr.convert_from_pinhole_camera_parameters(camera_params, allow_arbitrary=True)
+    else:
+        # Use default view settings
+        ctr = vis.get_view_control()
+        set_consistent_view(ctr)
+
+
+    vis.run()
+    vis.destroy_window()
 
 def plot_full_results(raw_img, seg_map_color, depth_map_vis, pc_img, seglabels, class_id):
     """
@@ -181,7 +272,7 @@ def plot_full_results(raw_img, seg_map_color, depth_map_vis, pc_img, seglabels, 
     axs[1, 0].set_title("Predicted Depth")
     axs[1, 0].axis('off')
     axs[1, 1].imshow(pc_img)
-    axs[1, 1].set_title(f"3D Pointcloud with Rim: {seglabels(class_id).name}")
+    axs[1, 1].set_title(f"3D Pointcloud of: {seglabels(class_id).name}")
     axs[1, 1].axis('off')
     plt.tight_layout()
     plt.show()
@@ -273,7 +364,7 @@ if __name__ == '__main__':
     rim_mask = local_rim_mask(seg_map, args.class_a, args.class_b, rim_width=args.rim_width)
 
     # --- Render pointcloud view to image for the selected object (with rim)
-    pc_img = capture_pointcloud_image_with_rim(
+    pc_img, camera_params = capture_pointcloud_image_with_rim_fixed(
         cropped_raw_img, depth_map, seg_map, class_id=args.class_b, rim_mask=rim_mask, img_size=600
     )
 
@@ -287,65 +378,12 @@ if __name__ == '__main__':
         class_id=args.class_b
     )
 
-    # ---- Metrics ----
-    class_ids = np.unique(seg_map)
-    print("\n--- Depth Metrics Per Class ---")
-    for cls_id in class_ids:
-        mask = (seg_map == cls_id)
-        if mask.sum() < 10:
-            continue
-        class_depths = depth_map[mask]
-        mean_depth = np.mean(class_depths)
-        std_depth = np.std(class_depths)
-        print(f"Class {cls_id} ({SegLabels(cls_id).name}): mean depth = {mean_depth:.4f}, std = {std_depth:.4f}")
-
-        # Rank correlation
-        y_coords, x_coords = np.where(mask)
-        flat_positions = x_coords + y_coords * depth_map.shape[1]
-        rho, _ = spearmanr(flat_positions, class_depths.flatten())
-        print(f"   Spearman rank correlation ρ = {rho:.3f}")
-
-    # --- Relative Depth: Class B vs Class A ---
-    local_rim_depth_diff(seg_map, depth_map, args.class_a, args.class_b, SegLabels, rim_width=args.rim_width)
-
-
     if args.interactive:
-            mask = seg_map == args.class_b
-            rim_mask_here = rim_mask
-            img_arr = np.array(cropped_raw_img)
-            ys, xs = np.where(mask)
-            zs = depth_map[mask]
-            colors = img_arr[mask].astype(np.float32) / 255.0
-            part_points = np.stack([xs, ys, zs], axis=1).astype(np.float32)
+        create_interactive_pointcloud_fixed(
+            cropped_raw_img, depth_map, seg_map, rim_mask, args.class_b, SegLabels, camera_params
+        )
 
-            rim_ys, rim_xs = np.where(rim_mask_here)
-            rim_zs = depth_map[rim_mask_here]
-            rim_colors = img_arr[rim_mask_here].astype(np.float32) / 255.0
-            cyan = np.array([0.0, 1.0, 1.0], dtype=np.float32)
-            alpha = 0.3
-            rim_colors = alpha * cyan + (1 - alpha) * rim_colors
-            rim_points_xyz = np.stack([rim_xs, rim_ys, rim_zs], axis=1).astype(np.float32)
-
-            # Center and scale
-            all_points = np.concatenate([part_points, rim_points_xyz], axis=0)
-            centroid = np.mean(all_points, axis=0)
-            all_points -= centroid
-            scale = np.max(np.linalg.norm(all_points, axis=1))
-            all_points /= (scale + 1e-6)
-            all_points *= 600 * 0.4
-
-            n_part = part_points.shape[0]
-            part_points_scaled = all_points[:n_part]
-            rim_points_scaled = all_points[n_part:]
-
-            pcd_part = o3d.geometry.PointCloud()
-            pcd_part.points = o3d.utility.Vector3dVector(part_points_scaled)
-            pcd_part.colors = o3d.utility.Vector3dVector(colors)
-            pcd_rim = o3d.geometry.PointCloud()
-            pcd_rim.points = o3d.utility.Vector3dVector(rim_points_scaled)
-            pcd_rim.colors = o3d.utility.Vector3dVector(rim_colors)
-
-            o3d.visualization.draw_geometries(
-                [pcd_part, pcd_rim],
-                window_name=f"Interactive 3D Pointcloud (class {SegLabels(args.class_b).name})"
-            )
+    # ---- Metrics ----
+    # Relative Depth: Class B vs Class A
+    # local_rim_depth_diff(seg_map, depth_map, args.class_a, args.class_b, SegLabels, rim_width=args.rim_width)
+    comprehensive_depth_evaluation(depth_map, seg_map, class_labels_enum=SegLabels)
