@@ -1,23 +1,28 @@
 import argparse
 import os
-import sys
 import numpy as np
-from scipy.ndimage import label, find_objects
+from scipy.ndimage import binary_dilation
 from PIL import Image
 import cv2
 import torch
 from torchvision import transforms
 import matplotlib.pyplot as plt
 from scipy.stats import spearmanr
+from enum import Enum
+from time import time
+
+import open3d as o3d  # <--- The real 3D viewer!
 
 from depth_anything_v2.seg_deformable_depth import SegmentationDeformableDepth
 from util.vis import decode_segmap
-from time import time
 
-
-cur_path = os.path.abspath(os.path.dirname(__file__))
-root_path = os.path.split(cur_path)[0]
-sys.path.append(root_path)
+class SegLabels(Enum):
+    BACKGROUND = 0
+    HEAD = 1
+    BASEPLATE = 2
+    PREVIOUS_PART = 3
+    CURRENT_PART = 4
+    WELD_FLASH = 5
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Semantic Segmentation and Depth Inference')
@@ -25,29 +30,117 @@ def parse_args():
                         help='train/test data directory')
     parser.add_argument('--model-weights-dir', type=str, default="../model_weights",
                         help='pretrained model weights directory')
-    parser.add_argument('--base-size', type=int, default=580, help='base image size')
-    parser.add_argument('--crop-size', type=int, default=518, help='crop image size')
-    parser.add_argument('--batch-size', type=int, default=16, metavar='N', help='input batch size')
-    parser.add_argument('--epochs', type=int, default=200, metavar='N', help='number of epochs to train')
-    parser.add_argument('--lr', type=float, default=1e-4, metavar='LR', help='learning rate')
-    parser.add_argument('--save-dir', default='./ckpt', help='Directory for saving checkpoint models')
     parser.add_argument('--device', default='cuda', help='Training device')
     parser.add_argument('--image-path', type=str, required=True, help='Path to input image')
-    parser.add_argument('--class-a', type=int, default=2, help='Class A ID for relative depth comparison')
-    parser.add_argument('--class-b', type=int, default=1, help='Class B ID for relative depth comparison')
-    args = parser.parse_args()
-    return args
-
+    parser.add_argument('--class-a', type=int, default=SegLabels.BASEPLATE.value, help='Class A ID for relative depth comparison')
+    parser.add_argument('--class-b', type=int, default=SegLabels.CURRENT_PART.value, help='Class B ID for relative depth comparison')
+    return parser.parse_args()
 
 def make_divisible(val, divisor=14):
-    return val - (val % divisor)
+    if isinstance(val, (tuple, list, np.ndarray)):
+        return tuple(v - (v % divisor) for v in val)
+    else:
+        return val - (val % divisor)
 
+def plot_panel_results(raw_img, seg_map_color, depth_map_vis):
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    axs[0].imshow(raw_img)
+    axs[0].set_title('Original Image')
+    axs[0].axis('off')
+    axs[1].imshow(seg_map_color)
+    axs[1].set_title('Predicted Segmentation')
+    axs[1].axis('off')
+    axs[2].imshow(depth_map_vis)
+    axs[2].set_title('Predicted Depth')
+    axs[2].axis('off')
+    plt.tight_layout()
+    plt.show()
+
+def show_vggt_3d(rgb_img, depth_map, seg_map, class_id, max_points=50000):
+    """
+    Shows interactive Open3D window of the class mask as colored point cloud (VGG-T style!)
+    """
+    mask = seg_map == class_id
+    if not np.any(mask):
+        print(f"No pixels found for class {class_id}")
+        return
+
+    # Masked coordinates and color
+    ys, xs = np.where(mask)
+    zs = depth_map[mask]
+    img_arr = np.array(rgb_img)
+    colors = img_arr[mask].astype(np.float32) / 255.0
+
+    # Subsample for speed/clarity if too large
+    if len(xs) > max_points:
+        idx = np.random.choice(len(xs), max_points, replace=False)
+        xs, ys, zs, colors = xs[idx], ys[idx], zs[idx], colors[idx]
+
+    # (N, 3) points in image space (X, Y, Z)
+    points = np.stack([xs, ys, zs], axis=1)
+    # You may want to flip the y axis to match top-left image origin
+    points[:, 1] = rgb_img.height - points[:, 1]
+
+    # Build open3d point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    print("Launching interactive 3D viewer (close the window to continue)...")
+    o3d.visualization.draw_geometries(
+        [pcd],
+        window_name=f"VGG-T Style 3D: {class_id}",
+        width=1280,
+        height=960,
+        point_show_normal=False
+    )
+
+def local_rim_depth_diff(seg_map, depth, class_A, class_B, SegLabels, rim_width=5):
+    mask_A = (seg_map == class_A)
+    mask_B = (seg_map == class_B)
+
+    if not (np.any(mask_A) and np.any(mask_B)):
+        print(f"\nCannot compute relative depth: one or both classes not present in segmentation.")
+        return
+
+    mask_B_2d = mask_B
+    mask_A_2d = mask_A
+    depth_2d = depth
+
+    # Dilate mask B to create a rim region around B
+    dilated_B = binary_dilation(mask_B_2d, iterations=rim_width)
+    rim_A = np.logical_and(dilated_B, mask_A_2d)
+
+    # Get coordinates
+    by, bx = np.where(mask_B_2d)
+    ay, ax = np.where(rim_A)
+    if len(ay) == 0:
+        print("No rim found, try increasing rim_width.")
+        return
+
+    # Vectorized: match each B pixel to its *nearest* rim A pixel
+    A_coords = np.stack([ay, ax], axis=1)
+    B_coords = np.stack([by, bx], axis=1)
+
+    if len(B_coords) > 1000:
+        idx = np.random.choice(len(B_coords), 1000, replace=False)
+        B_coords = B_coords[idx]
+
+    dists = np.linalg.norm(B_coords[:, None, :] - A_coords[None, :, :], axis=2)
+    idx_closest = np.argmin(dists, axis=1)
+    A_closest = A_coords[idx_closest]
+
+    d_B = depth_2d[B_coords[:, 0], B_coords[:, 1]]
+    d_A = depth_2d[A_closest[:, 0], A_closest[:, 1]]
+
+    avg_diff = np.mean(d_B - d_A)
+    print(f"\n--- Relative Depth (rim method) ---")
+    print(f"Avg. Depth ({SegLabels(class_B).name}) - Local Rim Depth ({SegLabels(class_A).name}) = {avg_diff:.4f}")
 
 if __name__ == '__main__':
     args = parse_args()
-    raw_img = Image.open(args.image_path)
-    img_w, img_h = make_divisible(np.array(raw_img.size))
-
+    raw_img = Image.open(args.image_path).convert('RGB')
+    img_w, img_h = make_divisible(raw_img.size)
     model = SegmentationDeformableDepth(
         encoder="vitb",
         num_classes=6,
@@ -64,13 +157,21 @@ if __name__ == '__main__':
         transforms.ToTensor(),
         transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
     ])
+
+    raw_img_transform = transforms.Compose([
+        transforms.CenterCrop((img_h, img_w)),
+    ])
+
     transformed_image = input_transform(raw_img).unsqueeze(0).to(args.device)
     start_time = time()
-    depth, seg_map = model.infer_image(transformed_image)
+    with torch.no_grad():
+        depth, seg_map = model.infer_image(transformed_image)
     end_time = time()
-    print(f"SegDepthInference took {end_time - start_time} seconds")
+    print(f"SegDepthInference took {end_time - start_time:.2f} seconds")
+
     # Process segmentation output
-    seg_map_color = decode_segmap(seg_map[0])  # (H, W, 3)
+    seg_map = seg_map[0]
+    seg_map_color = decode_segmap(seg_map)  # (H, W, 3)
 
     # Process depth output
     depth_map = depth[0]
@@ -78,19 +179,22 @@ if __name__ == '__main__':
     depth_map_inv = 1.0 - depth_map_norm
     depth_map_vis = cv2.applyColorMap((depth_map_inv * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
 
-    # Plot
-    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-    axs[0].imshow(raw_img)
-    axs[0].set_title('Original Image')
-    axs[0].axis('off')
-    axs[1].imshow(seg_map_color)
-    axs[1].set_title('Predicted Segmentation')
-    axs[1].axis('off')
-    axs[2].imshow(depth_map_vis)
-    axs[2].set_title('Predicted Depth')
-    axs[2].axis('off')
-    plt.tight_layout()
-    plt.show()
+    cropped_raw_img = raw_img_transform(raw_img)
+    # Show classic panel for quick overview
+    plot_panel_results(
+        cropped_raw_img,
+        seg_map_color,
+        depth_map_vis,
+    )
+
+    # --- VGG-T style interactive 3D for just the selected object
+    show_vggt_3d(
+        cropped_raw_img,
+        depth_map,
+        seg_map,
+        class_id=args.class_b,  # Typically the object of interest
+        max_points=100000
+    )
 
     # ---- Metrics ----
     class_ids = np.unique(seg_map)
@@ -99,127 +203,19 @@ if __name__ == '__main__':
         mask = (seg_map == cls_id)
         if mask.sum() < 10:
             continue
-        class_depths = depth[mask]
+        class_depths = depth_map[mask]
         mean_depth = np.mean(class_depths)
         std_depth = np.std(class_depths)
-        print(f"Class {cls_id}: mean depth = {mean_depth:.4f}, std = {std_depth:.4f}")
+        print(f"Class {cls_id} ({SegLabels(cls_id).name}): mean depth = {mean_depth:.4f}, std = {std_depth:.4f}")
 
         # Rank correlation
-        y_coords, x_coords = np.where(mask[0])
-        flat_positions = x_coords + y_coords * depth.shape[1]
+        y_coords, x_coords = np.where(mask)
+        flat_positions = x_coords + y_coords * depth_map.shape[1]
         rho, _ = spearmanr(flat_positions, class_depths.flatten())
         print(f"   Spearman rank correlation ρ = {rho:.3f}")
 
     # --- Relative Depth: Class B vs Class A ---
     class_A = args.class_a
     class_B = args.class_b
-    mask_A = (seg_map == class_A)
-    mask_B = (seg_map == class_B)
 
-    if np.any(mask_A) and np.any(mask_B):
-        coords_A = np.column_stack(np.where(mask_A[0]))
-        coords_B = np.column_stack(np.where(mask_B[0]))
-        min_diffs = []
-
-        for ax, ay in coords_A:
-            dists = np.linalg.norm(coords_B - np.array([ax, ay]), axis=1)
-            idx_closest = np.argmin(dists)
-            bx, by = coords_B[idx_closest]
-            d_A = depth[0, ax, ay]
-            d_B = depth[0, bx, by]
-            min_diffs.append(d_B - d_A)
-
-        if len(min_diffs) > 0:
-            avg_diff = np.mean(min_diffs)
-            print(f"\n--- Relative Depth ---")
-            print(f"Avg. Depth (Class {class_B}) - Depth (Class {class_A}) = {avg_diff:.4f}")
-    else:
-        print(f"\nCannot compute relative depth: one or both classes not present in segmentation.")
-
-
-def find_object_pixel_indices(seg_map: np.ndarray, target_label: int):
-    """
-    Finds pixel indices for each connected component (object) of the target label.
-
-    Parameters:
-    - seg_map: np.ndarray, shape (H, W), segmentation map
-    - target_label: int, the label to extract connected objects for
-
-    Returns:
-    - object_indices: list of np.ndarrays, each array is shape (N, 2) with (row, col) of pixels for each object
-    """
-    # Binary mask where label matches
-    mask = (seg_map == target_label).astype(np.uint8)
-
-    # Label connected components in the mask
-    labeled_array, num_features = label(mask)
-
-    # Extract indices for each component
-    object_indices = []
-    for component_id in range(1, num_features + 1):
-        rows, cols = np.where(labeled_array == component_id)
-        indices = np.stack((rows, cols), axis=1)  # shape (N, 2)
-        object_indices.append(indices)
-
-    return object_indices
-
-
-def find_relative_height(seg_map, depth_map, label_a, label_b, margin=5):
-    """
-    Measures relative depth between label_a objects and adjacent label_b regions.
-
-    Parameters:
-    - seg_map: np.ndarray of shape (H, W), semantic segmentation map
-    - depth_map: np.ndarray of shape (H, W), depth map aligned to seg_map
-    - label_a: int, object of interest
-    - label_b: int, reference object (e.g., baseplate)
-    - margin: int, number of pixels to expand A's bounding box
-
-    Returns:
-    - List of dicts with 'object_index', 'depth_a', 'depth_b', 'relative_depth'
-    """
-    results = []
-
-    # Label connected components of object A
-    mask_a = (seg_map == label_a).astype(np.uint8)
-    labeled_a, num_a = label(mask_a)
-
-    for obj_idx in range(1, num_a + 1):
-        coords = np.array(np.where(labeled_a == obj_idx)).T
-        if coords.size == 0:
-            continue
-
-        rows, cols = coords[:, 0], coords[:, 1]
-
-        # Compute bounding box with margin
-        rmin = max(rows.min() - margin, 0)
-        rmax = min(rows.max() + margin + 1, seg_map.shape[0])
-        cmin = max(cols.min() - margin, 0)
-        cmax = min(cols.max() + margin + 1, seg_map.shape[1])
-
-        # Mask for A and B in bounding box
-        region = seg_map[rmin:rmax, cmin:cmax]
-        depth_region = depth_map[rmin:rmax, cmin:cmax]
-
-        mask_a_region = (region == label_a)
-        mask_b_region = (region == label_b)
-
-        # Extract depth values
-        depth_a = depth_region[mask_a_region]
-        depth_b = depth_region[mask_b_region]
-
-        if len(depth_a) == 0 or len(depth_b) == 0:
-            continue
-
-        mean_a = np.median(depth_a)
-        mean_b = np.median(depth_b)
-        rel_depth = mean_b - mean_a
-
-        results.append({
-            "object_index": obj_idx,
-            "depth_a": float(mean_a),
-            "depth_b": float(mean_b),
-            "relative_depth": float(rel_depth),
-        })
-
-    return results
+    local_rim_depth_diff(seg_map, depth_map, class_A, class_B, SegLabels, rim_width=10)
