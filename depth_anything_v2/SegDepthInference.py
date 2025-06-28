@@ -6,6 +6,8 @@ import cv2
 import torch
 from torchvision import transforms
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('TkAgg')
 from scipy.stats import spearmanr
 from enum import Enum
 from time import time
@@ -321,6 +323,8 @@ if __name__ == '__main__':
     args = parse_args()
     raw_img = Image.open(args.image_path).convert('RGB')
     img_w, img_h = make_divisible(raw_img.size)
+
+    device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
     model = SegmentationDeformableDepth(
         encoder="vitb",
         num_classes=6,
@@ -329,8 +333,9 @@ if __name__ == '__main__':
         features=768,
         out_channels=[256, 512, 1024, 1024],
         model_weights_dir=args.model_weights_dir,
+        device=device,
     )
-    model.eval().to(args.device)
+    model.eval().to(device)
 
     input_transform = transforms.Compose([
         transforms.CenterCrop((img_h, img_w)),
@@ -340,7 +345,7 @@ if __name__ == '__main__':
     raw_img_transform = transforms.Compose([
         transforms.CenterCrop((img_h, img_w)),
     ])
-    transformed_image = input_transform(raw_img).unsqueeze(0).to(args.device)
+    transformed_image = input_transform(raw_img).unsqueeze(0).to(device)
     start_time = time()
     with torch.no_grad():
         depth, seg_map = model.infer_image(transformed_image)

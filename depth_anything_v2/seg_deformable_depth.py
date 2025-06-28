@@ -137,8 +137,8 @@ class SegmentationDeformableDepth(nn.Module):
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder],
                                                            return_class_token=True)
 
-        depth = self.depth_head(features, patch_h, patch_w)
-        depth = F.relu(depth)
+        # depth = self.depth_head(features, patch_h, patch_w)
+        # depth = F.relu(depth)
 
         seg_logits = self.seg_head(
             out_features=features,
@@ -146,7 +146,7 @@ class SegmentationDeformableDepth(nn.Module):
             pw=patch_w
         )
 
-        return depth.squeeze(1), seg_logits.squeeze(1)
+        return None, seg_logits.squeeze(1)
 
     @torch.no_grad()
     def infer_image(self, image):
@@ -155,7 +155,7 @@ class SegmentationDeformableDepth(nn.Module):
         seg_probs = F.softmax(seg_logits, dim=1)
         segmentation_pred = torch.argmax(seg_probs, dim=1)
 
-        return depth.cpu().numpy(), segmentation_pred.cpu().numpy()
+        return None, segmentation_pred.cpu().numpy()
 
     def image2tensor(self, raw_image, input_size=518):
         transform = Compose([
