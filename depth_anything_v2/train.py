@@ -4,6 +4,8 @@ import datetime
 import os
 import shutil
 import sys
+from unittest import case
+
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -12,6 +14,8 @@ import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision
 from torchvision import transforms
+
+from depth_anything_v2.SegDepthInference import SegLabels
 
 cur_path = os.path.abspath(os.path.dirname(__file__))
 root_path = os.path.split(cur_path)[0]
@@ -42,7 +46,7 @@ def parse_args():
 
     parser.add_argument('--batch-size', type=int, default=6, metavar='N',
                         help='input batch size for training')
-    parser.add_argument('--epochs', type=int, default=100, metavar='N',
+    parser.add_argument('--epochs', type=int, default=300, metavar='N',
                         help='number of epochs to train')
     parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
                         help='learning rate')
@@ -98,9 +102,27 @@ class Trainer(object):
             model_weights_dir=args.model_weights_dir,
         )
 
-        self.criterion = nn.CrossEntropyLoss(ignore_index=255)
+        class_weights = []
+        for seg_label in SegLabels:
+            match seg_label.name:
+                case "BACKGROUND":
+                    class_weights.append(0.1)
+                case "HEAD":
+                    class_weights.append(0.1)
+                case "BASEPLATE":
+                    class_weights.append(0.1)
+                case "PREVIOUS_PART":
+                    class_weights.append(0.1)
+                case "CURRENT_PART":
+                    class_weights.append(0.5)
+                case "WELD_FLASH":
+                    class_weights.append(0.1)
+
+        class_weights = torch.FloatTensor(class_weights).to(self.device)
+
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=255)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr)
-        self.metric = SegmentationMetric(len(trainset.classes))
+        self.metric = SegmentationMetric(len(trainset.classes), class_weights)
         self.best_pred = -1
 
     def train(self):
@@ -157,7 +179,7 @@ class Trainer(object):
 
             outputs, pred = self.model.infer_image(image)
             self.metric.update(outputs, target)
-            pixAcc, mIoU = self.metric.get()
+            pixAcc, mIoU, weighted_mIou = self.metric.get()
 
             for i in range(pred.shape[0]):
                 if len(_preds) < 64:
@@ -166,9 +188,10 @@ class Trainer(object):
         _preds = torchvision.utils.make_grid(_preds, nrow=8)
         _targets = torchvision.utils.make_grid(_targets, nrow=8)
         new_pred = (pixAcc + mIoU) / 2
-        print(f"pixel acc: {pixAcc}\nmIoU: {mIoU}")
+        print(f"pixel acc: {pixAcc}\nmIoU: {mIoU}\nweighted_mIoU: {weighted_mIou}")
         writer.add_scalar('validation pixAcc', pixAcc, it)
         writer.add_scalar('validation mIoU', mIoU, it)
+        writer.add_scalar('validation weighted mIoU', weighted_mIou, it)
         writer.add_image("val_gt", _targets, it)
         writer.add_image("val_pred", _preds, it)
         if new_pred > self.best_pred:
