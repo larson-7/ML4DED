@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from enum import Enum
 
 from depth_anything_v2.seg_deformable_depth import SegmentationDeformableDepth
-from util.vis import decode_segmap
+from depth_anything_v2.util.vis import decode_segmap
 
 class SegLabels(Enum):
     BACKGROUND = 0
@@ -69,11 +69,12 @@ def main():
 
     seg_map_np = seg_map[0]
     img_np = np.array(raw_img.resize((img_w, img_h)))
+    seg_color = decode_segmap(seg_map_np, nc=8)
     overlay_img = overlay_segmentation(img_np, seg_map_np)
 
     # Display overlay
     plt.figure(figsize=(10, 8))
-    plt.imshow(overlay_img)
+    plt.imshow(seg_color)
     plt.title("Segmentation Overlay")
     plt.axis("off")
     plt.tight_layout()
