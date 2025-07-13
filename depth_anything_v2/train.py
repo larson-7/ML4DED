@@ -100,6 +100,7 @@ class Trainer(object):
             features=768,
             out_channels=[256, 512, 1024, 1024],
             model_weights_dir=args.model_weights_dir,
+            use_clstoken=True,
         )
 
         class_weights = []
