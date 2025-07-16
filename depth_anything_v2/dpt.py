@@ -27,12 +27,14 @@ class DPTHead(nn.Module):
         features=256, 
         use_bn=False, 
         out_channels=[256, 512, 1024, 1024], 
-        use_clstoken=False
+        use_clstoken=False,
+        use_temporal_consistency=False,
+        num_temporal_tokens=1,
     ):
         super(DPTHead, self).__init__()
         
         self.use_clstoken = use_clstoken
-        
+
         self.projects = nn.ModuleList([
             nn.Conv2d(
                 in_channels=in_channels,
@@ -98,17 +100,37 @@ class DPTHead(nn.Module):
             nn.ReLU(True),
             nn.Identity(),
         )
+
+        # temporal consistency tokens
+        self.use_temporal_consistency = use_temporal_consistency
+        if self.use_temporal_consistency:
+            self.num_temporal_tokens = num_temporal_tokens
+
+            # how many patches each temporal token gets
+            num_temporal_patch_channels = in_channels // num_temporal_tokens
+
+            self.temporal_token_extraction = nn.ModuleList()
+            for i in range(self.num_temporal_tokens):
+                self.temporal_token_extraction.append(
+                    nn.Sequential(
+                        nn.Conv2d(num_temporal_patch_channels, 1, kernel_size=1, stride=1, padding=0),
+                        nn.ReLU(True),
+                    )
+                )
+
+
     
     def forward(self, out_features, patch_h, patch_w):
         out = []
         for i, x in enumerate(out_features):
             if self.use_clstoken:
                 x, cls_token = x[0], x[1]
+                # create readout which is a copy of the cls token for each spatial token
                 readout = cls_token.unsqueeze(1).expand_as(x)
                 x = self.readout_projects[i](torch.cat((x, readout), -1))
             else:
                 x = x[0]
-            
+
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
             
             x = self.projects[i](x)
@@ -117,7 +139,26 @@ class DPTHead(nn.Module):
             out.append(x)
         
         layer_1, layer_2, layer_3, layer_4 = out
-        
+
+        if self.use_temporal_consistency:
+            B, C, H, W = layer_4.shape
+            assert H >= self.num_temporal_tokens, "Cannot have more temporal tokens than patch rows"
+
+            # Divide into `n` vertical chunks (along height axis)
+            chunks = torch.chunk(layer_4, self.num_temporal_tokens, dim=2)  # list of (B, C, H_chunk, W)
+
+            temporal_tokens = []
+            for i, chunk in enumerate(chunks):
+                # Pool over spatial dimensions to get one token per chunk
+                temporal_out = self.temporal_token_extraction[i](chunk)
+                token = temporal_out.view(B, C)  # (B, C)
+                temporal_tokens.append(token)
+
+            # Stack: (B, n, C)
+            temporal_tokens = torch.stack(temporal_tokens, dim=1)
+        # todo: no need to cast temporal tokens onto spatial tokens, the cross-attention block next will do that.
+        #Need to add the N frames of temporal tokens as an input to this forward call
+
         layer_1_rn = self.scratch.layer1_rn(layer_1)
         layer_2_rn = self.scratch.layer2_rn(layer_2)
         layer_3_rn = self.scratch.layer3_rn(layer_3)
@@ -131,7 +172,7 @@ class DPTHead(nn.Module):
         out = self.scratch.output_conv1(path_1)
         out = F.interpolate(out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True)
         out = self.scratch.output_conv2(out)
-        
+
         return out
 
 
