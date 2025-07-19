@@ -150,8 +150,6 @@ class DPTHead(nn.Module):
         # Cross-attention for temporal consistency
         if use_temporal_consistency:
             # kernel size is dependent on how many tokens each extractor should extract
-            assert self.num_spatial_tokens % self.num_temporal_tokens == 0, "Number of total tokens must be divisible by number of temporal tokens"
-            self.tokens_per_extractor = self.num_spatial_tokens // self.num_temporal_tokens
             self.temporal_extractor = nn.ModuleList([Token1DCNNExtractor(in_channels=in_channels,
                                                                          out_channels=in_channels, num_tokens_out=1,
                                                                          kernel_size=3) for x in
@@ -160,7 +158,9 @@ class DPTHead(nn.Module):
 
     def extract_temporal_tokens(self, x):
         B, N, C = x.shape
-        x_grouped = x.view(B, self.num_temporal_tokens, self.tokens_per_extractor,
+        assert N % self.num_temporal_tokens == 0, "Number of total tokens must be divisible by number of temporal tokens"
+        tokens_per_extractor = N // self.num_temporal_tokens
+        x_grouped = x.view(B, self.num_temporal_tokens, tokens_per_extractor,
                            C)  # (B, num_temporal_tokens, tokens_per_extractor, C)
 
         temporal_tokens = []
@@ -208,12 +208,12 @@ class DPTHead(nn.Module):
                 class_token_out = None
                 if N_cls == 1:
                     class_token_out = query[:, 0, :]  # (B, C)
-                patch_tokens_out = query[:, N_cls:N_cls + N, :]  # (B, N, C)
+                spatial_tokens_out = query[:, N_cls:N_cls + N, :]  # (B, N, C)
                 temporal_tokens_out = query[:, N_cls + N:, :]  # (B, N_spatial, C)
                 temporal_tokens_out = temporal_tokens_out.permute(0, 2, 1)  # (B, C, N_spatial)
 
                 temporal_class_tokens_out = torch.cat((class_token_out.unsqueeze(-1), temporal_tokens_out), dim=-1)
-                x = patch_tokens_out.permute(0, 2, 1).reshape(B, C, H, W)
+                x = spatial_tokens_out
 
             else:
                 readout = cls_token.unsqueeze(1).expand_as(x)
@@ -280,7 +280,7 @@ def main():
         previous_temporal_tokens=previous_temporal_tokens,
     )
 
-    print(f"Output depth shape: {out.shape}")
+    print(f"Output dpt shape: {out.shape}")
     print(f"Temporal+class tokens shape: {temporal_class_tokens_out.shape}")
 
 
