@@ -9,6 +9,33 @@ from .dinov2 import DINOv2
 from .util.transform import Resize, NormalizeImage, PrepareForNet
 from .util.blocks import FeatureFusionBlock, _make_scratch
 
+
+class Token1DCNNExtractor(nn.Module):
+    def __init__(self, in_channels, out_channels, num_tokens_out=1, kernel_size=3):
+        """
+        Args:
+            in_channels: C (feature dim)
+            out_channels: output dim for each temporal token (can be = in_channels)
+            num_tokens_out: number of output tokens (length after 1D CNN, usually 1)
+            kernel_size: 1D conv kernel size
+        """
+        super().__init__()
+        self.conv1d = nn.Conv1d(
+            in_channels, out_channels, kernel_size,
+            stride=1, padding=kernel_size // 2
+        )
+        self.pool = nn.AdaptiveAvgPool1d(num_tokens_out)  # Downsample N -> num_tokens_out
+
+    def forward(self, x):
+        """
+        x: (B, C, N)
+        Returns: (B, out_channels, num_tokens_out)
+        """
+        x = self.conv1d(x)    # (B, out_channels, N)
+        x = self.pool(x)      # (B, out_channels, num_tokens_out)
+        return x
+
+
 # --- Utility Functions ---
 def _make_fusion_block(features, use_bn, size=None):
     return FeatureFusionBlock(
@@ -20,24 +47,6 @@ def _make_fusion_block(features, use_bn, size=None):
         align_corners=True,
         size=size,
     )
-
-def extract_spatial_chunks(x, num_chunks_h, num_chunks_w):
-    # x: (B, C, H, W)
-    B, C, H, W = x.shape
-    kh = math.ceil(H / num_chunks_h)
-    kw = math.ceil(W / num_chunks_w)
-    tokens = []
-    for i in range(num_chunks_h):
-        for j in range(num_chunks_w):
-            h_start = i * kh
-            h_end = min((i + 1) * kh, H)
-            w_start = j * kw
-            w_end = min((j + 1) * kw, W)
-            chunk = x[:, :, h_start:h_end, w_start:w_end]  # (B, C, h_chunk, w_chunk)
-            pooled = F.adaptive_avg_pool2d(chunk, 1).view(B, C)  # (B, C)
-            tokens.append(pooled)
-    tokens = torch.stack(tokens, dim=1)  # (B, num_chunks_h * num_chunks_w, C)
-    return tokens
 
 
 class CrossAttentionBlock(nn.Module):
@@ -61,16 +70,16 @@ class DPTHead(nn.Module):
             out_channels=[256, 512, 1024, 1024],
             use_clstoken=False,
             use_temporal_consistency=False,
-            num_spatial_tokens_h=2,  # number of spatial chunks along height
-            num_spatial_tokens_w=2,  # number of spatial chunks along width
-            cross_attn_heads=8,
+            num_spatial_tokens=144,
+            num_temporal_tokens=2,
+            cross_attn_heads=4,
     ):
         super(DPTHead, self).__init__()
 
         self.use_clstoken = use_clstoken
         self.use_temporal_consistency = use_temporal_consistency
-        self.num_spatial_tokens_h = num_spatial_tokens_h
-        self.num_spatial_tokens_w = num_spatial_tokens_w
+        self.num_spatial_tokens = num_spatial_tokens
+        self.num_temporal_tokens = num_temporal_tokens
 
         self.projects = nn.ModuleList([
             nn.Conv2d(
@@ -140,9 +149,29 @@ class DPTHead(nn.Module):
 
         # Cross-attention for temporal consistency
         if use_temporal_consistency:
+            # kernel size is dependent on how many tokens each extractor should extract
+            assert self.num_spatial_tokens % self.num_temporal_tokens == 0, "Number of total tokens must be divisible by number of temporal tokens"
+            self.tokens_per_extractor = self.num_spatial_tokens // self.num_temporal_tokens
+            self.temporal_extractor = nn.ModuleList([Token1DCNNExtractor(in_channels=in_channels,
+                                                                         out_channels=in_channels, num_tokens_out=1,
+                                                                         kernel_size=3) for x in
+                                                     range(self.num_temporal_tokens)])
             self.cross_attn_block = CrossAttentionBlock(embed_dim=in_channels, num_heads=cross_attn_heads)
 
-    def forward(self, out_features, patch_h, patch_w, previous_temporal_tokens=None,):
+    def extract_temporal_tokens(self, x):
+        B, N, C = x.shape
+        x_grouped = x.view(B, self.num_temporal_tokens, self.tokens_per_extractor,
+                           C)  # (B, num_temporal_tokens, tokens_per_extractor, C)
+
+        temporal_tokens = []
+        for i, extractor in enumerate(self.temporal_extractor):
+            group = x_grouped[:, i, :, :].transpose(1, 2)  # (B, C, tokens_per_extractor)
+            token = extractor(group)  # (B, C_out, 1)
+            temporal_tokens.append(token.squeeze(-1))  # (B, C_out)
+        temporal_tokens = torch.stack(temporal_tokens, dim=1)  # (B, num_extractors, C_out)
+        return temporal_tokens
+
+    def forward(self, out_features, patch_h, patch_w, previous_temporal_tokens=None, ):
         out = []
         for i, x in enumerate(out_features):
             if self.use_clstoken:
@@ -153,15 +182,10 @@ class DPTHead(nn.Module):
 
             # Extract spatial tokens from last feature map layer
             if self.use_temporal_consistency and i == len(out_features) - 1:
-                spatial_tokens = extract_spatial_chunks(
-                    x,
-                    num_chunks_h=self.num_spatial_tokens_h,
-                    num_chunks_w=self.num_spatial_tokens_w
-                )  # (B, num_spatial_chunks, C)
-
-                B, C, H, W = x.shape
+                B, N, C = x.shape
+                temporal_tokens = self.extract_temporal_tokens(x)
                 patch_tokens = x.view(B, C, -1).permute(0, 2, 1)  # (B, H*W, C)
-                token_list = [patch_tokens, spatial_tokens]
+                token_list = [patch_tokens, temporal_tokens]
                 if self.use_clstoken and cls_token is not None:
                     token_list.insert(0, cls_token.unsqueeze(1))  # (B, 1, C)
                 query = torch.cat(token_list, dim=1)  # (B, N_query, C)
@@ -180,16 +204,15 @@ class DPTHead(nn.Module):
 
                 # Extract tokens
                 N_cls = 1 if self.use_clstoken and cls_token is not None else 0
-                N_patches = H * W
 
                 class_token_out = None
                 if N_cls == 1:
                     class_token_out = query[:, 0, :]  # (B, C)
-                patch_tokens_out = query[:, N_cls:N_cls + N_patches, :]  # (B, H*W, C)
-                temporal_tokens_out = query[:, N_cls + N_patches:, :]  # (B, N_spatial, C)
-                temporal_tokens_out = temporal_tokens_out.permute(0, 2, 1) #(B, C, N_spatial)
+                patch_tokens_out = query[:, N_cls:N_cls + N, :]  # (B, N, C)
+                temporal_tokens_out = query[:, N_cls + N:, :]  # (B, N_spatial, C)
+                temporal_tokens_out = temporal_tokens_out.permute(0, 2, 1)  # (B, C, N_spatial)
 
-                temporal_class_tokens_out = torch.cat((class_token_out, temporal_tokens_out), dim=1)
+                temporal_class_tokens_out = torch.cat((class_token_out.unsqueeze(-1), temporal_tokens_out), dim=-1)
                 x = patch_tokens_out.permute(0, 2, 1).reshape(B, C, H, W)
 
             else:
@@ -223,20 +246,15 @@ class DPTHead(nn.Module):
 
 
 def main():
-    B = 2                # batch size
-    C = 256              # input channel size
+    B = 2  # batch size
+    C = 256  # input channel size
     patch_h = patch_w = 12
     num_layers = 4
     out_channels = [256, 512, 1024, 1024]
 
-    # Create fake intermediate ViT outputs for 4 layers
-    # Format: [(tokens, cls_token), ...]
-    # tokens: (B, N, C) where N = H*W, cls_token: (B, C)
     out_features = []
+    N = patch_h * patch_w  # ALWAYS FIXED for ViT!
     for l in range(num_layers):
-        H = patch_h // (2 ** (num_layers - l - 1))
-        W = patch_w // (2 ** (num_layers - l - 1))
-        N = H * W
         tokens = torch.randn(B, N, C)
         cls_token = torch.randn(B, C)
         out_features.append((tokens, cls_token))
@@ -250,8 +268,8 @@ def main():
         in_channels=C,
         use_clstoken=True,
         use_temporal_consistency=True,
-        num_spatial_tokens_h=2,
-        num_spatial_tokens_w=2
+        num_spatial_tokens=N,
+        num_temporal_tokens=N_temporal,
     )
 
     # Run head
@@ -264,6 +282,7 @@ def main():
 
     print(f"Output depth shape: {out.shape}")
     print(f"Temporal+class tokens shape: {temporal_class_tokens_out.shape}")
+
 
 if __name__ == '__main__':
     main()
