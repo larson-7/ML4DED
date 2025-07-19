@@ -70,7 +70,6 @@ class DPTHead(nn.Module):
             out_channels=[256, 512, 1024, 1024],
             use_clstoken=False,
             use_temporal_consistency=False,
-            num_spatial_tokens=144,
             num_temporal_tokens=2,
             cross_attn_heads=4,
     ):
@@ -78,7 +77,6 @@ class DPTHead(nn.Module):
 
         self.use_clstoken = use_clstoken
         self.use_temporal_consistency = use_temporal_consistency
-        self.num_spatial_tokens = num_spatial_tokens
         self.num_temporal_tokens = num_temporal_tokens
 
         self.projects = nn.ModuleList([
@@ -268,7 +266,6 @@ def main():
         in_channels=C,
         use_clstoken=True,
         use_temporal_consistency=True,
-        num_spatial_tokens=N,
         num_temporal_tokens=N_temporal,
     )
 

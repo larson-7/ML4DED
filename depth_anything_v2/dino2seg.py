@@ -18,9 +18,12 @@ class DPTSegmentationHead(nn.Module):
             in_channels=768,  # transformer embedding dim
             features=256,  # decoder channels
             out_channels=[256, 512, 1024, 1024],  # for the 4 scale projections
-            num_classes=40,  # NYUDv2
+            num_classes=6,
             use_bn=False,
-            use_clstoken=False
+            use_clstoken=False,
+            use_temporal_consistency=False,
+            num_temporal_tokens=2,
+            cross_attn_heads=4,
     ):
         super().__init__()
         self.use_clstoken = use_clstoken
@@ -111,6 +114,9 @@ class Dino2Seg(nn.Module):
             out_channels=[256, 512, 1024, 1024],
             use_bn=False,
             use_clstoken=False,
+            use_temporal_consistency=False,
+            num_temporal_tokens=2,
+            cross_attn_heads=4,
             model_weights_dir="",
             device="cuda",
     ):
@@ -164,6 +170,9 @@ class Dino2Seg(nn.Module):
             out_channels=out_channels,
             use_bn=use_bn,
             use_clstoken=use_clstoken,
+            use_temporal_consistency=use_temporal_consistency,
+            num_temporal_tokens=num_temporal_tokens,
+            cross_attn_heads=cross_attn_heads,
         )
 
         # Load segmentation head weights if available
