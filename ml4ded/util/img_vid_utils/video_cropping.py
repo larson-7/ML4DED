@@ -1,4 +1,3 @@
-import cv2
 import subprocess
 import re
 import os

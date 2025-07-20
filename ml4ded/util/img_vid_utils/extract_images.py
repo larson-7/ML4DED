@@ -1,8 +1,6 @@
 import os
 import cv2
-import random
 from video_cropping import detect_crop_params, crop_video_ffmpeg
-from pathlib import Path
 
 data_dir = "data"
 data_dir = os.path.join(os.getcwd(), data_dir)

@@ -1,8 +1,8 @@
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-def get_train_augmentation(img_h, img_w):
-    return A.Compose([
+def get_train_augmentation(img_h, img_w, use_replay=True):
+    base_transforms = [
         A.HorizontalFlip(p=0.5),
         A.Rotate(limit=15, p=0.5),
         A.RandomBrightnessContrast(p=0.3),
@@ -12,7 +12,11 @@ def get_train_augmentation(img_h, img_w):
         A.Resize(height=img_h, width=img_w),
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
-    ])
+    ]
+    if use_replay:
+        return A.ReplayCompose(base_transforms)
+    else:
+        return A.Compose(base_transforms)
 
 def get_val_augmentation(img_h, img_w):
     return A.Compose([

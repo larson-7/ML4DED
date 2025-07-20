@@ -1,42 +1,40 @@
 import argparse
-import time
-import datetime
 import os
 import shutil
 import sys
-from unittest import case
-
+from enum import Enum
 from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.utils.data as data
-import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision
-from torchvision import transforms
-
-from depth_anything_v2.SegDepthInference import SegLabels
 
 cur_path = os.path.abspath(os.path.dirname(__file__))
 root_path = os.path.split(cur_path)[0]
 sys.path.append(root_path)
 
-from dino2seg import Dino2Seg
-from util.segmentationMetric import *
-from util.vis import decode_segmap
-from util.nyu_d_v2.nyudv2_seg_dataset import NYUSDv2SegDataset
-from util.ml4ded.ml4ded_seg_dataset import ML4DEDSegmentationDataset
-from util.early_stopping import EarlyStopping
-from util.augmentations import get_train_augmentation, get_val_augmentation
+from ml4ded.models.dino2seg import Dino2Seg
+from ml4ded.util.training.segmentationMetric import *
+from ml4ded.util.vis import decode_segmap
+from ml4ded.util.dataset.ml4ded_seg_dataset import ML4DEDSegmentationDataset
+from ml4ded.util.training.early_stopping import EarlyStopping
+from ml4ded.util.dataset.augmentations.augmentations import get_train_augmentation, get_val_augmentation
 
+
+class SegLabels(Enum):
+    BACKGROUND = 0
+    HEAD = 1
+    BASEPLATE = 2
+    PREVIOUS_PART = 3
+    CURRENT_PART = 4
+    WELD_FLASH = 5
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Semantic Segmentation Training With Pytorch')
-    parser.add_argument('--dataset', type=str, default="ml4ded", choices=["nyu", "ml4ded"],
-                        help='Dataset to train on (nyu or ml4ded)')
-    parser.add_argument('--data-dir', type=str, default="../data/ml4ded",
+    parser.add_argument('--data-dir', type=str, default="./data/ml4ded",
                         help='train/test data directory')
-    parser.add_argument('--model-weights-dir', type=str, default="../model_weights",
+    parser.add_argument('--model-weights-dir', type=str, default="./model_weights",
                         help='pretrained model weights directory')
 
     parser.add_argument('--base-size', type=int, default=580,
@@ -46,7 +44,7 @@ def parse_args():
 
     parser.add_argument('--batch-size', type=int, default=6, metavar='N',
                         help='input batch size for training')
-    parser.add_argument('--epochs', type=int, default=300, metavar='N',
+    parser.add_argument('--epochs', type=int, default=100, metavar='N',
                         help='number of epochs to train')
     parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
                         help='learning rate')
@@ -64,20 +62,11 @@ class Trainer(object):
         self.args = args
         self.device = torch.device(args.device)
         self.early_stopper = EarlyStopping(patience=10, delta=0.01, verbose=True)
-        # -------- Dataset selection logic ---------
-        if args.dataset == "nyu":
-            dataset_class = NYUSDv2SegDataset
-            print("Using NYUv2 dataset")
-            default_data_dir = os.path.join(root_path, "data/nyu_depth_v2")
-            img_h, img_w = make_divisible(480), make_divisible(640)
-        elif args.dataset == "ml4ded":
-            dataset_class = ML4DEDSegmentationDataset
-            print("Using ML4DED dataset")
-            default_data_dir = os.path.join(root_path, "data/ml4ded")
-            # Adapt to your actual image size
-            img_h, img_w = make_divisible(1072), make_divisible(608)
-        else:
-            raise ValueError(f"Unknown dataset {args.dataset}")
+
+        dataset_class = ML4DEDSegmentationDataset
+        default_data_dir = os.path.join(root_path, "data/ml4ded")
+        # Adapt to your actual image size
+        img_h, img_w = make_divisible(1072), make_divisible(608)
 
         data_dir = args.data_dir if args.data_dir else default_data_dir
 
@@ -86,8 +75,8 @@ class Trainer(object):
         val_transform = get_val_augmentation(img_h, img_w)
 
         # dataset and dataloader
-        trainset = dataset_class(data_dir, split="train", mode="train", transform=train_transform)
-        valset = dataset_class(data_dir, split="test", mode="val", transform=val_transform)
+        trainset = dataset_class(data_dir, split="train", mode="train", temporal_window=4, transform=train_transform)
+        valset = dataset_class(data_dir, split="test", mode="val",temporal_window=4,  transform=val_transform)
         
         self.train_loader = data.DataLoader(dataset=trainset, batch_size=args.batch_size, pin_memory=True)
         self.val_loader = data.DataLoader(dataset=valset, batch_size=args.batch_size, pin_memory=True)
@@ -101,6 +90,9 @@ class Trainer(object):
             out_channels=[256, 512, 1024, 1024],
             model_weights_dir=args.model_weights_dir,
             use_clstoken=True,
+            use_temporal_consistency=True,
+            num_temporal_tokens=2,
+            cross_attn_heads=4,
         )
 
         class_weights = []
@@ -136,11 +128,23 @@ class Trainer(object):
             self.model.train()
             for images, targets, _ in tqdm(self.train_loader):
                 iteration += 1
+
+                # images: (B, T, 3, H, W), targets: (B, T, H, W)
                 images = images.to(self.device)
                 targets = targets.to(self.device)
-                outputs = self.model(images)
+
+                current_images = images[:, -1]  # (B, 3, H, W)
+                current_targets = targets[:, -1]  # (B, H, W)
+
+                prev_temporal_images = images[:, :-1]  # (B, T-1, 3, H, W)
+                prev_temporal_images = prev_temporal_images.permute(1, 0, 2, 3, 4)  # (T-1, B, 3, H, W)
+
+                previous_temporal_tokens = self.model.get_previous_temporal_tokens(prev_temporal_images)
+
+                outputs, _ = self.model(current_images, previous_temporal_tokens)  # shape (B, C, H, W)
                 pred = torch.max(outputs, 1).indices
-                loss = self.criterion(outputs, targets.squeeze(1))
+
+                loss = self.criterion(outputs, current_targets)
                 loss = torch.mean(loss)
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -156,7 +160,7 @@ class Trainer(object):
                     pred_img = decode_segmap(pred[0].cpu().data.numpy())
                     gt_img = decode_segmap(targets[0].squeeze(0).cpu().data.numpy())
                     pred_img = torch.from_numpy(pred_img).permute(2, 0, 1)
-                    gt_img = torch.from_numpy(gt_img).permute(2, 0, 1)
+                    gt_img = torch.from_numpy(gt_img[-1, :, :, :]).permute(1, 0, 2)
                     writer.add_image("pred", pred_img, iteration)
                     writer.add_image("gt", gt_img, iteration)
             
@@ -172,33 +176,50 @@ class Trainer(object):
         torch.cuda.empty_cache()
         self.model.eval()
         _preds, _targets = [], []
+
         print("Evaluating")
-        for image, target, _ in tqdm(self.val_loader):
-            image = image.to(self.device)
-            target = target.to(self.device)
-            target = target.squeeze(1)
+        self.metric.reset()
 
-            outputs, pred = self.model.infer_image(image)
-            self.metric.update(outputs, target)
-            pixAcc, mIoU, weighted_mIou = self.metric.get()
+        for images, targets, _ in tqdm(self.val_loader):
+            images = images.to(self.device)  # (B, T, 3, H, W)
+            targets = targets.to(self.device)  # (B, T, H, W)
 
-            for i in range(pred.shape[0]):
-                if len(_preds) < 64:
-                    _preds.append(torchvision.transforms.ToTensor()(decode_segmap(pred[i])))
-                    _targets.append(torchvision.transforms.ToTensor()(decode_segmap(target[i].cpu().data.numpy())))
+            current_images = images[:, -1]  # (B, 3, H, W)
+            current_targets = targets[:, -1]  # (B, H, W)
+
+            prev_temporal_images = images[:, :-1]  # (B, T-1, 3, H, W)
+            prev_temporal_images = prev_temporal_images.permute(1, 0, 2, 3, 4)  # (T-1, B, 3, H, W)
+
+            with torch.no_grad():
+                previous_temporal_tokens = self.model.get_previous_temporal_tokens(prev_temporal_images)
+                outputs, pred_tokens = self.model(current_images, previous_temporal_tokens)  # (B, C, H, W)
+                preds = torch.argmax(outputs, dim=1)  # (B, H, W)
+
+            self.metric.update(outputs, current_targets)
+            pixAcc, mIoU, weighted_mIoU = self.metric.get()
+
+            for i in range(preds.shape[0]):
+                if len(_preds) < 64:  # only log first few batches
+                    _preds.append(torchvision.transforms.ToTensor()(decode_segmap(preds[i].cpu().numpy())))
+                    _targets.append(torchvision.transforms.ToTensor()(decode_segmap(current_targets[i].cpu().numpy())))
+
         _preds = torchvision.utils.make_grid(_preds, nrow=8)
         _targets = torchvision.utils.make_grid(_targets, nrow=8)
+
         new_pred = (pixAcc + mIoU) / 2
-        print(f"pixel acc: {pixAcc}\nmIoU: {mIoU}\nweighted_mIoU: {weighted_mIou}")
+        print(f"pixel acc: {pixAcc:.4f}\nmIoU: {mIoU:.4f}\nweighted mIoU: {weighted_mIoU:.4f}")
         writer.add_scalar('validation pixAcc', pixAcc, it)
         writer.add_scalar('validation mIoU', mIoU, it)
-        writer.add_scalar('validation weighted mIoU', weighted_mIou, it)
+        writer.add_scalar('validation weighted mIoU', weighted_mIoU, it)
         writer.add_image("val_gt", _targets, it)
         writer.add_image("val_pred", _preds, it)
+
         if new_pred > self.best_pred:
             is_best = True
             self.best_pred = new_pred
+
         save_checkpoint(self.model, self.args, is_best)
+        return new_pred
 
 
 def save_checkpoint(model, args, is_best=False):

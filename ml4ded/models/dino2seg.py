@@ -6,11 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from depth_anything_v2.dinov2 import DINOv2
-from depth_anything_v2.util.blocks import FeatureFusionBlock, _make_scratch
-from depth_anything_v2.base import ConvBlock
-from torchvision.transforms import Compose
-from depth_anything_v2.util.transform import Resize, NormalizeImage, PrepareForNet
+from ml4ded.dinov2.dinov2 import DINOv2
+from ml4ded.models.blocks import FeatureFusionBlock, _make_scratch
+import torch.nn.init as init
 
 class Token1DCNNExtractor(nn.Module):
     def __init__(self, in_channels, out_channels, num_tokens_out=1, kernel_size=3):
@@ -250,7 +248,7 @@ class Dino2Seg(nn.Module):
         self.encoder = encoder
         self.pretrained = DINOv2(model_name=encoder)
         self.device = device
-
+        self.use_clstoken = use_clstoken
         # ──────────────── WEIGHT LOADING LOGIC ──────────────── #
         vitb_weight_file = None
         seg_weight_file = None
@@ -291,36 +289,60 @@ class Dino2Seg(nn.Module):
             cross_attn_heads=cross_attn_heads,
         )
 
-        # Load segmentation head weights if available
         if seg_weight_file:
             print(f"Loading segmentation head weights from: {seg_weight_file}")
-            seg_state_dict = torch.load(seg_weight_file, map_location='cpu')
-            missing_keys, unexpected_keys = self.seg_head.load_state_dict(seg_state_dict, strict=False)
-            # print warnings if keys don't match exactly
+            state_dict = torch.load(seg_weight_file, map_location='cpu')
+            missing_keys, unexpected_keys = self.seg_head.load_state_dict(state_dict, strict=False)
+
             if missing_keys:
-                print("[Seg Head] Missing keys:", missing_keys)
+                print("[SegHead] Missing keys:", missing_keys)
+
+                # Reinitialize only submodules that have missing weights
+                modules_to_init = set(k.split('.')[0] for k in missing_keys)
+                for name, module in self.seg_head.named_children():
+                    if name in modules_to_init:
+                        print(f"Reinitializing module: seg_head.{name}")
+                        self.initialize_module_weights(module)
+
             if unexpected_keys:
-                print("[Seg Head] Unexpected keys:", unexpected_keys)
+                print("[SegHead] Unexpected keys:", unexpected_keys)
         else:
             print("No segmentation head weights found.")
 
         self.pretrained.to(self.device)
         self.seg_head.to(self.device)
 
+    def initialize_module_weights(self, module):
+        """
+        Reinitialize weights in a module according to layer type.
+        """
+        for m in module.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
+    def forward(self, x, previous_temporal_tokens):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
 
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder],
                                                            return_class_token=True)
 
-        seg_logits = self.seg_head(
+        seg_logits, temporal_tokens = self.seg_head(
             out_features=features,
-            ph=patch_h,
-            pw=patch_w
+            patch_h=patch_h,
+            patch_w=patch_w,
+            previous_temporal_tokens=previous_temporal_tokens,
         )
 
-        return seg_logits.squeeze(1)
+        return seg_logits.squeeze(1), temporal_tokens
 
     @torch.no_grad()
     def infer_image(self, image):
@@ -329,6 +351,48 @@ class Dino2Seg(nn.Module):
         segmentation_pred = torch.argmax(seg_probs, dim=1)
 
         return seg_probs, segmentation_pred.cpu().numpy()
+
+    @torch.no_grad()
+    def get_previous_temporal_tokens(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Extracts temporal tokens from the last N frames.
+
+        Args:
+            images: Tensor of shape (T, B, 3, H, W), where T = number of previous frames.
+
+        Returns:
+            Tensor of shape (B, T * num_temporal_tokens, C)
+        """
+        T, B, _, H, W = images.shape
+        device = self.device
+        images = images.to(device)
+
+        all_temporal_tokens = []
+
+        for t in range(T):
+            frame = images[t]  # (B, 3, H, W)
+
+            # Get last layer output from ViT encoder (returns [(tokens, cls_token)])
+            out_features = self.pretrained.get_intermediate_layers(
+                frame,
+                [self.intermediate_layer_idx[self.encoder][-1]],  # last layer only
+                return_class_token=True
+            )  # returns List[(tokens, cls_token)]
+
+            # Step 2: Extract temporal tokens using seg_head
+            temporal_tokens = self.seg_head.extract_temporal_tokens(out_features[0][0])
+
+            if self.use_clstoken:
+                temporal_tokens = torch.cat([out_features[0][1].unsqueeze(1), temporal_tokens], dim=1)# (B, num_tokens, C)
+            all_temporal_tokens.append(temporal_tokens)  # append (B, num_tokens, C)
+
+        # Stack and flatten across T time steps
+        temporal_token_stack = torch.stack(all_temporal_tokens, dim=1)  # (B, T, num_tokens, C)
+        B, T, N_tokens, C = temporal_token_stack.shape
+        temporal_token_stack = temporal_token_stack.view(B, T * N_tokens, C)  # (B, T*num_tokens, C)
+
+        return temporal_token_stack
+
 
 def main():
     B = 2  # batch size
