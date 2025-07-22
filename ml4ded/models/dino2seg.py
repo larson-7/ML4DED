@@ -10,30 +10,37 @@ from ml4ded.dinov2.dinov2 import DINOv2
 from ml4ded.models.blocks import FeatureFusionBlock, _make_scratch
 import torch.nn.init as init
 
-class Token1DCNNExtractor(nn.Module):
-    def __init__(self, in_channels, out_channels, num_tokens_out=1, kernel_size=3):
+class TemporalExtractor(nn.Module):
+    def __init__(self, embed_dim, num_temporal_tokens=4):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_temporal_tokens = num_temporal_tokens
+
+        self.temporal_conv = nn.Conv1d(
+            embed_dim, embed_dim,
+            kernel_size=3, padding=1, groups=embed_dim  # depthwise conv
+        )
+
+        self.temporal_pool = nn.AdaptiveAvgPool1d(num_temporal_tokens)
+
+    def forward(self, features):
         """
         Args:
-            in_channels: C (feature dim)
-            out_channels: output dim for each temporal token (can be = in_channels)
-            num_tokens_out: number of output tokens (length after 1D CNN, usually 1)
-            kernel_size: 1D conv kernel size
+            features: (B, N_spatial, C) — features from a single image
+        Returns:
+            temporal_tokens: (B, num_temporal_tokens, C)
         """
-        super().__init__()
-        self.conv1d = nn.Conv1d(
-            in_channels, out_channels, kernel_size,
-            stride=1, padding=kernel_size // 2
-        )
-        self.pool = nn.AdaptiveAvgPool1d(num_tokens_out)  # Downsample N -> num_tokens_out
+        B, N, C = features.shape
 
-    def forward(self, x):
-        """
-        x: (B, C, N)
-        Returns: (B, out_channels, num_tokens_out)
-        """
-        x = self.conv1d(x)    # (B, out_channels, N)
-        x = self.pool(x)      # (B, out_channels, num_tokens_out)
-        return x
+        x = features.transpose(1, 2)  # (B, C, N)
+        x = self.temporal_conv(x)     # (B, C, N)
+        x = F.relu(x)
+
+        x = self.temporal_pool(x)     # (B, C, num_tokens)
+        temporal_tokens = x.transpose(1, 2)  # (B, num_tokens, C)
+
+        return temporal_tokens
+
 
 
 # --- Utility Functions ---
@@ -54,9 +61,9 @@ class CrossAttentionBlock(nn.Module):
         super().__init__()
         self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
 
-    def forward(self, query, key, value):
-        attn_out, _ = self.cross_attn(query, key, value)
-        return attn_out
+    def forward(self, query, key, value, need_weights=False):
+        attn_out, attn_weights = self.cross_attn(query, key, value, need_weights=need_weights)
+        return attn_out, attn_weights
 
 
 class DPTSegmentationHead(nn.Module):
@@ -71,11 +78,13 @@ class DPTSegmentationHead(nn.Module):
             use_temporal_consistency=False,
             num_temporal_tokens=2,
             cross_attn_heads=4,
+            temporal_window=4,
     ):
         super().__init__()
         self.use_clstoken = use_clstoken
         self.use_temporal_consistency = use_temporal_consistency
         self.num_temporal_tokens = num_temporal_tokens
+        self.temporal_window = temporal_window
 
         self.projects = nn.ModuleList([
             nn.Conv2d(in_channels, out_ch, kernel_size=1)
@@ -121,30 +130,17 @@ class DPTSegmentationHead(nn.Module):
         # Cross-attention for temporal consistency
         if use_temporal_consistency:
             # kernel size is dependent on how many tokens each extractor should extract
-            self.temporal_extractor = nn.ModuleList([Token1DCNNExtractor(in_channels=in_channels,
-                                                                         out_channels=in_channels, num_tokens_out=1,
-                                                                         kernel_size=3) for x in
-                                                     range(self.num_temporal_tokens)])
+            self.temporal_extractor = TemporalExtractor(embed_dim=in_channels,
+                                                        num_temporal_tokens=num_temporal_tokens,)
+
             self.cross_attn_block = CrossAttentionBlock(embed_dim=in_channels, num_heads=cross_attn_heads)
+            self.gate = nn.Parameter(torch.tensor(1.0))
 
-    def extract_temporal_tokens(self, x):
-        B, N, C = x.shape
-        assert N % self.num_temporal_tokens == 0, "Number of total tokens must be divisible by number of temporal tokens"
-        tokens_per_extractor = N // self.num_temporal_tokens
-        x_grouped = x.view(B, self.num_temporal_tokens, tokens_per_extractor,
-                           C)  # (B, num_temporal_tokens, tokens_per_extractor, C)
-
-        temporal_tokens = []
-        for i, extractor in enumerate(self.temporal_extractor):
-            group = x_grouped[:, i, :, :].transpose(1, 2)  # (B, C, tokens_per_extractor)
-            token = extractor(group)  # (B, C_out, 1)
-            temporal_tokens.append(token.squeeze(-1))  # (B, C_out)
-        temporal_tokens = torch.stack(temporal_tokens, dim=1)  # (B, num_extractors, C_out)
-        return temporal_tokens
 
     def forward(self, out_features, patch_h, patch_w, previous_temporal_tokens=None, ):
         out = []
-        temporal_class_tokens_out = None
+        temporal_tokens_out = None
+        attn_weights = None
 
         for i, x in enumerate(out_features):
             if self.use_clstoken:
@@ -156,9 +152,9 @@ class DPTSegmentationHead(nn.Module):
             # Extract spatial tokens from last feature map layer
             if self.use_temporal_consistency and i == len(out_features) - 1:
                 B, N, C = x.shape
-                temporal_tokens = self.extract_temporal_tokens(x)
+                current_temporal_tokens = self.temporal_extractor(x)
                 patch_tokens = x.view(B, C, -1).permute(0, 2, 1)  # (B, H*W, C)
-                token_list = [patch_tokens, temporal_tokens]
+                token_list = [patch_tokens, current_temporal_tokens]
                 if self.use_clstoken and cls_token is not None:
                     token_list.insert(0, cls_token.unsqueeze(1))  # (B, 1, C)
                 query = torch.cat(token_list, dim=1)  # (B, N_query, C)
@@ -166,14 +162,15 @@ class DPTSegmentationHead(nn.Module):
                 if previous_temporal_tokens is not None:
                     # previous_temporal_tokens: (B, N_temporal, C)
                     # Use as keys and values
-                    attended = self.cross_attn_block(
+                    attended, attn_weights = self.cross_attn_block(
                         query=query,
                         key=previous_temporal_tokens,
-                        value=previous_temporal_tokens
+                        value=previous_temporal_tokens,
+                        need_weights=True,
                     )  # (B, N_query, C)
 
-                    # fuse attended output with original query (residual)
-                    query = query + attended
+                    # fuse gated attended output with original query (residual)
+                    query = query + torch.sigmoid(self.gate) * attended
 
                 # Extract tokens
                 N_cls = 1 if self.use_clstoken and cls_token is not None else 0
@@ -185,7 +182,6 @@ class DPTSegmentationHead(nn.Module):
                 temporal_tokens_out = query[:, N_cls + N:, :]  # (B, N_spatial, C)
                 temporal_tokens_out = temporal_tokens_out.permute(0, 2, 1)  # (B, C, N_spatial)
 
-                temporal_class_tokens_out = torch.cat((class_token_out.unsqueeze(-1), temporal_tokens_out), dim=-1)
                 x = spatial_tokens_out
 
             else:
@@ -215,7 +211,7 @@ class DPTSegmentationHead(nn.Module):
         out = F.interpolate(out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True)
         out = self.scratch.output_conv2(out)
 
-        return out, temporal_class_tokens_out
+        return out, temporal_tokens_out, attn_weights
 
 class Dino2Seg(nn.Module):
     def __init__(
@@ -230,6 +226,7 @@ class Dino2Seg(nn.Module):
             use_clstoken=False,
             use_temporal_consistency=False,
             num_temporal_tokens=2,
+            temporal_window=4,
             cross_attn_heads=4,
             model_weights_dir="",
             device="cuda",
@@ -287,6 +284,7 @@ class Dino2Seg(nn.Module):
             use_temporal_consistency=use_temporal_consistency,
             num_temporal_tokens=num_temporal_tokens,
             cross_attn_heads=cross_attn_heads,
+            temporal_window=temporal_window,
         )
 
         if seg_weight_file:
@@ -335,14 +333,14 @@ class Dino2Seg(nn.Module):
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder],
                                                            return_class_token=True)
 
-        seg_logits, temporal_tokens = self.seg_head(
+        seg_logits, temporal_tokens, attn_weights = self.seg_head(
             out_features=features,
             patch_h=patch_h,
             patch_w=patch_w,
             previous_temporal_tokens=previous_temporal_tokens,
         )
 
-        return seg_logits.squeeze(1), temporal_tokens
+        return seg_logits.squeeze(1), temporal_tokens, attn_weights
 
     @torch.no_grad()
     def infer_image(self, image):
@@ -379,11 +377,8 @@ class Dino2Seg(nn.Module):
                 return_class_token=True
             )  # returns List[(tokens, cls_token)]
 
-            # Step 2: Extract temporal tokens using seg_head
-            temporal_tokens = self.seg_head.extract_temporal_tokens(out_features[0][0])
-
-            if self.use_clstoken:
-                temporal_tokens = torch.cat([out_features[0][1].unsqueeze(1), temporal_tokens], dim=1)# (B, num_tokens, C)
+            # Extract temporal tokens using seg_head
+            temporal_tokens = self.seg_head.temporal_extractor(out_features[0][0])
             all_temporal_tokens.append(temporal_tokens)  # append (B, num_tokens, C)
 
         # Stack and flatten across T time steps
