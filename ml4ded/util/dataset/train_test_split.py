@@ -2,7 +2,7 @@ import os
 import shutil
 import random
 
-ROOT = '/Users/sheanscottjr/omscs/cs8903/SegDefDepth/training_data'
+ROOT = '/home/ec2-user/SegDefDepth/training_data'
 IMG_DIR = os.path.join(ROOT, 'segmentation_images')
 MASK_DIR = os.path.join(ROOT, 'segmentation_masks')
 SPLIT_DIR = os.path.join(ROOT, 'official_splits')

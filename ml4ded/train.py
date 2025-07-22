@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument('--crop-size', type=int, default=518,
                         help='crop image size')
 
-    parser.add_argument('--batch-size', type=int, default=1, metavar='N',
+    parser.add_argument('--batch-size', type=int, default=12, metavar='N',
                         help='input batch size for training')
     parser.add_argument('--epochs', type=int, default=100, metavar='N',
                         help='number of epochs to train')
@@ -98,19 +98,19 @@ class Trainer(object):
 
         class_weights = []
         for seg_label in SegLabels:
-            match seg_label.name:
-                case "BACKGROUND":
-                    class_weights.append(0.1)
-                case "HEAD":
-                    class_weights.append(0.1)
-                case "BASEPLATE":
-                    class_weights.append(0.1)
-                case "PREVIOUS_PART":
-                    class_weights.append(0.1)
-                case "CURRENT_PART":
-                    class_weights.append(0.5)
-                case "WELD_FLASH":
-                    class_weights.append(0.1)
+            name = seg_label.name
+            if name == "BACKGROUND":
+                class_weights.append(0.1)
+            elif name == "HEAD":
+                class_weights.append(0.1)
+            elif name == "BASEPLATE":
+                class_weights.append(0.1)
+            elif name == "PREVIOUS_PART":
+                class_weights.append(0.1)
+            elif name == "CURRENT_PART":
+                class_weights.append(0.5)
+            elif name == "WELD_FLASH":
+                class_weights.append(0.1)
 
         class_weights = torch.FloatTensor(class_weights).to(self.device)
 
