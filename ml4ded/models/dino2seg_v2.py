@@ -6,10 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ml4ded.models.unet_decoder import UnetDecoder, UNetSegmentationHead
-from ml4ded.dinov2.dinov2 import DINOv2
-from ml4ded.models.blocks import FeatureFusionBlock, _make_scratch
+from dinov2.dinov2 import DINOv2
+from models.blocks import FeatureFusionBlock, _make_scratch
 import torch.nn.init as init
+import segmentation_models_pytorch as smp
 
 class Token1DCNNExtractor(nn.Module):
     def __init__(self, in_channels, out_channels, num_tokens_out=1, kernel_size=3):
@@ -72,11 +72,13 @@ class DPTSegmentationHead(nn.Module):
             use_temporal_consistency=False,
             num_temporal_tokens=2,
             cross_attn_heads=4,
+            decoder_type='unet',
     ):
         super().__init__()
         self.use_clstoken = use_clstoken
         self.use_temporal_consistency = use_temporal_consistency
         self.num_temporal_tokens = num_temporal_tokens
+        self.decoder_type = decoder_type
 
         self.projects = nn.ModuleList([
             nn.Conv2d(in_channels, out_ch, kernel_size=1)
@@ -96,28 +98,39 @@ class DPTSegmentationHead(nn.Module):
                     nn.GELU()
                 ) for _ in range(4)
             ])
+        
+        if decoder_type == 'unet':
+            # Use a simple UNet from segmentation_models_pytorch
+            self.unet = smp.Unet(
+                encoder_name='resnet50',  # No encoder, just decoder
+                encoder_depth=4,
+                in_channels=out_channels[-1],  # last feature map channels
+                classes=num_classes,
+                decoder_channels=out_channels[::-1],  # reverse for upsampling
+            )
+        else:
 
-        self.scratch = _make_scratch(out_channels, features, groups=1, expand=False)
-        self.scratch.refinenet1 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
-        self.scratch.refinenet2 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
-        self.scratch.refinenet3 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
-        self.scratch.refinenet4 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
+            self.scratch = _make_scratch(out_channels, features, groups=1, expand=False)
+            self.scratch.refinenet1 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
+            self.scratch.refinenet2 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
+            self.scratch.refinenet3 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
+            self.scratch.refinenet4 = FeatureFusionBlock(features, nn.ReLU(), bn=use_bn)
 
-        head_features_1 = features
-        head_features_2 = 32
+            head_features_1 = features
+            head_features_2 = 32
 
-        # reduce channels
-        self.scratch.output_conv1 = nn.Conv2d(
-            head_features_1, head_features_1 // 2,
-            kernel_size=3, stride=1, padding=1
-        )
+            # reduce channels
+            self.scratch.output_conv1 = nn.Conv2d(
+                head_features_1, head_features_1 // 2,
+                kernel_size=3, stride=1, padding=1
+            )
 
-        # final segmentation prediction
-        self.scratch.output_conv2 = nn.Sequential(
-            nn.Conv2d(head_features_1 // 2, head_features_2, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(True),
-            nn.Conv2d(head_features_2, num_classes, kernel_size=1, stride=1, padding=0),
-        )
+            # final segmentation prediction
+            self.scratch.output_conv2 = nn.Sequential(
+                nn.Conv2d(head_features_1 // 2, head_features_2, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(True),
+                nn.Conv2d(head_features_2, num_classes, kernel_size=1, stride=1, padding=0),
+            )
 
         # Cross-attention for temporal consistency
         if use_temporal_consistency:
@@ -201,20 +214,24 @@ class DPTSegmentationHead(nn.Module):
 
         layer_1, layer_2, layer_3, layer_4 = out  # (B, C, H, W)
 
+        if self.decoder_type == 'unet':
+            # Only use the last feature map as input to UNet decoder
+            out = self.unet(layer_4)
+        else:
         # --- Standard DPT Head fusion/decoding ---
-        layer_1_rn = self.scratch.layer1_rn(layer_1)
-        layer_2_rn = self.scratch.layer2_rn(layer_2)
-        layer_3_rn = self.scratch.layer3_rn(layer_3)
-        layer_4_rn = self.scratch.layer4_rn(layer_4)
+            layer_1_rn = self.scratch.layer1_rn(layer_1)
+            layer_2_rn = self.scratch.layer2_rn(layer_2)
+            layer_3_rn = self.scratch.layer3_rn(layer_3)
+            layer_4_rn = self.scratch.layer4_rn(layer_4)
 
-        path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
-        path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
-        path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
-        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
+            path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+            path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
+            path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
+            path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
 
-        out = self.scratch.output_conv1(path_1)
-        out = F.interpolate(out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True)
-        out = self.scratch.output_conv2(out)
+            out = self.scratch.output_conv1(path_1)
+            out = F.interpolate(out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True)
+            out = self.scratch.output_conv2(out)
 
         return out, temporal_class_tokens_out
 
@@ -234,12 +251,8 @@ class Dino2Seg(nn.Module):
             cross_attn_heads=4,
             model_weights_dir="",
             device="cuda",
-            head_type="unet",
-            unet_decoder_channels=[768, 768, 768],
     ):
         super(Dino2Seg, self).__init__()
-
-        self.head_type = head_type
 
         self.intermediate_layer_idx = {
             'vits': [2, 5, 8, 11],
@@ -282,60 +295,41 @@ class Dino2Seg(nn.Module):
         else:
             print("No ViT-b backbone weights found.")
 
-        if head_type == "unet":
-            # Example: get encoder_channels from DINOv2 output shapes
-            self.unet_decoder = UnetDecoder(
-                encoder_channels=[768, 768, 768, 768],  # Example, adjust as needed
-                decoder_channels=unet_decoder_channels,
-                n_blocks=3,
-            )
-            self.segmentation_head = UNetSegmentationHead(
-                nn.Conv2d(unet_decoder_channels[-1], num_classes, kernel_size=1),
-                num_temporal_tokens=num_temporal_tokens
-            )
-        else:
-
         # Setup segmentation head
-            self.seg_head = DPTSegmentationHead(
-                in_channels=features,
-                num_classes=num_classes,
-                out_channels=out_channels,
-                use_bn=use_bn,
-                use_clstoken=use_clstoken,
-                use_temporal_consistency=use_temporal_consistency,
-                num_temporal_tokens=num_temporal_tokens,
-                cross_attn_heads=cross_attn_heads,
-            )
+        self.seg_head = DPTSegmentationHead(
+            in_channels=features,
+            num_classes=num_classes,
+            out_channels=out_channels,
+            use_bn=use_bn,
+            use_clstoken=use_clstoken,
+            use_temporal_consistency=use_temporal_consistency,
+            num_temporal_tokens=num_temporal_tokens,
+            cross_attn_heads=cross_attn_heads,
+            decoder_type='unet' if encoder in ['vitb', 'vits'] else 'dpt',
+        )
 
-            if seg_weight_file:
-                print(f"Loading segmentation head weights from: {seg_weight_file}")
-                state_dict = torch.load(seg_weight_file, map_location='cpu')
-                missing_keys, unexpected_keys = self.seg_head.load_state_dict(state_dict, strict=False)
+        if seg_weight_file:
+            print(f"Loading segmentation head weights from: {seg_weight_file}")
+            state_dict = torch.load(seg_weight_file, map_location='cpu')
+            missing_keys, unexpected_keys = self.seg_head.load_state_dict(state_dict, strict=False)
 
-                if missing_keys:
-                    print("[SegHead] Missing keys:", missing_keys)
+            if missing_keys:
+                print("[SegHead] Missing keys:", missing_keys)
 
-                    # Reinitialize only submodules that have missing weights
-                    modules_to_init = set(k.split('.')[0] for k in missing_keys)
-                    for name, module in self.seg_head.named_children():
-                        if name in modules_to_init:
-                            print(f"Reinitializing module: seg_head.{name}")
-                            self.initialize_module_weights(module)
+                # Reinitialize only submodules that have missing weights
+                modules_to_init = set(k.split('.')[0] for k in missing_keys)
+                for name, module in self.seg_head.named_children():
+                    if name in modules_to_init:
+                        print(f"Reinitializing module: seg_head.{name}")
+                        self.initialize_module_weights(module)
 
-                if unexpected_keys:
-                    print("[SegHead] Unexpected keys:", unexpected_keys)
-            else:
-                print("No segmentation head weights found.")
+            if unexpected_keys:
+                print("[SegHead] Unexpected keys:", unexpected_keys)
+        else:
+            print("No segmentation head weights found.")
 
-        # self.pretrained.to(self.device)
-        # self.seg_head.to(self.device)
         self.pretrained.to(self.device)
-        if hasattr(self, "seg_head"):
-            self.seg_head.to(self.device)
-        if hasattr(self, "unet_decoder"):
-            self.unet_decoder.to(self.device)
-        if hasattr(self, "segmentation_head"):
-            self.segmentation_head.to(self.device)
+        self.seg_head.to(self.device)
 
     def initialize_module_weights(self, module):
         """
@@ -360,30 +354,14 @@ class Dino2Seg(nn.Module):
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder],
                                                            return_class_token=True)
 
-        if self.head_type == "unet":
-            # Convert transformer tokens to [B, C, H, W] feature maps for each scale
-            # Example: features = [(tokens, cls_token), ...]
-            feature_maps = []
-            patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
-            for i, (tokens, cls_token) in enumerate(features):
-                # tokens: [B, N, C] -> [B, C, H, W]
-                B, N, C = tokens.shape
-                fmap = tokens.permute(0, 2, 1).reshape(B, C, patch_h, patch_w)
-                #print(f"UNet feature map {i}: shape = {fmap.shape}") 
-                feature_maps.append(fmap)
-            # Optionally add input image as first skip connection if needed
-            decoder_out = self.unet_decoder(feature_maps)
-            seg_logits = self.segmentation_head(decoder_out)
-            return seg_logits, None
-        else:
-            patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
-            seg_logits, temporal_tokens = self.seg_head(
-                out_features=features,
-                patch_h=patch_h,
-                patch_w=patch_w,
-                previous_temporal_tokens=previous_temporal_tokens,
-            )
-            return seg_logits.squeeze(1), temporal_tokens
+        seg_logits, temporal_tokens = self.seg_head(
+            out_features=features,
+            patch_h=patch_h,
+            patch_w=patch_w,
+            previous_temporal_tokens=previous_temporal_tokens,
+        )
+
+        return seg_logits.squeeze(1), temporal_tokens
 
     @torch.no_grad()
     def infer_image(self, image):
@@ -421,23 +399,10 @@ class Dino2Seg(nn.Module):
             )  # returns List[(tokens, cls_token)]
 
             # Step 2: Extract temporal tokens using seg_head
-            if hasattr(self, "seg_head"):
-                temporal_tokens = self.seg_head.extract_temporal_tokens(out_features[0][0])
-            elif hasattr(self, "segmentation_head"):
-                temporal_tokens = self.segmentation_head.extract_temporal_tokens(out_features[0][0])
-            else:
-                raise AttributeError("No segmentation head found in Dino2Seg")
+            temporal_tokens = self.seg_head.extract_temporal_tokens(out_features[0][0])
 
             if self.use_clstoken:
-                cls_token = out_features[0][1].unsqueeze(1)  # (B, 1, C)
-                # Only concatenate if channel sizes match
-                if cls_token.shape[-1] == temporal_tokens.shape[-1]:
-                    temporal_tokens = torch.cat([cls_token, temporal_tokens], dim=1)
-                else:
-                    # Optionally warn or just skip
-                    pass
-            # if self.use_clstoken:
-            #     temporal_tokens = torch.cat([out_features[0][1].unsqueeze(1), temporal_tokens], dim=1)# (B, num_tokens, C)
+                temporal_tokens = torch.cat([out_features[0][1].unsqueeze(1), temporal_tokens], dim=1)# (B, num_tokens, C)
             all_temporal_tokens.append(temporal_tokens)  # append (B, num_tokens, C)
 
         # Stack and flatten across T time steps

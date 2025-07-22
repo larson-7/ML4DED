@@ -3,3 +3,6 @@
 /depth_anything_v2/runs
 **__pycache__/
 /depth_anything_v2/ckpt
+/training_data
+*.zip
+/runs

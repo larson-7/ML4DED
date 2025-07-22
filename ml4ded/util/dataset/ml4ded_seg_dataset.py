@@ -83,8 +83,9 @@ class ML4DEDSegmentationDataset(SegmentationDataset):
         """
         Example: 'rgb_2_00003.png' → ('2', 3)
         """
-        name = os.path.splitext(filename)[0]  # 'rgb_2_00003'
-        parts = name.split('_')  # ['rgb', '2', '00003']
+        name = os.path.basename(filename)  # <-- Only get the filename, not the path
+        name = os.path.splitext(name)[0]   # 'rgb_2_00003'
+        parts = name.split('_') 
         return parts[1], int(parts[2])
 
     def __getitem__(self, index):
