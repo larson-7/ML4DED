@@ -1,16 +1,19 @@
 import argparse
 import os
+import time
+
 import numpy as np
 from PIL import Image
 import torch
 from torchvision import transforms
 import matplotlib
+
 matplotlib.use('tkAgg')
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
 from enum import Enum
 
-from depth_anything_v2.seg_deformable_depth import SegmentationDeformableDepth
+from ml4ded.models.dino2seg import Dino2Seg
 from ml4ded.util.vis import decode_segmap
 
 class SegLabels(Enum):
@@ -22,10 +25,15 @@ class SegLabels(Enum):
     WELD_FLASH = 5
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Final Part Height Analysis per Frame with Overlay Scrubber')
-    parser.add_argument('--image-dir', type=str, required=True, help='Directory of input images')
-    parser.add_argument('--model-weights-dir', type=str, default="../model_weights", help='Pretrained model weights directory')
+    parser = argparse.ArgumentParser(description="Run model on single image, video, or directory of images.")
+
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--image', type=str, default="", help='Path to a single input image')
+    input_group.add_argument('--video', type=str, default="", help='Path to a video file')
+    input_group.add_argument('--image-dir', type=str, default="", help='Directory of input images')
+    parser.add_argument('--model-weights-dir', type=str, default="./model_weights", help='Pretrained model weights directory')
     parser.add_argument('--expected-height-mm', type=float, required=True, help='Expected real-world height (mm) of the final part (CURRENT_PART)')
+    parser.add_argument('--device', default='cpu', help='Training device')
     return parser.parse_args()
 
 def make_divisible(val, divisor=14):
@@ -47,26 +55,92 @@ def overlay_segmentation(image_np, seg_map, alpha=0.5):
     overlay = (alpha * seg_color + (1 - alpha) * image_np).astype(np.uint8)
     return overlay
 
+def download_weights_if_needed(model_weights_dir, use_temporal, repo_id="iknocodes/ml4ded"):
+    from huggingface_hub import hf_hub_download
+    os.makedirs(model_weights_dir, exist_ok=True)
+    # Check for backbone
+    vitb_weight_file = os.path.join(model_weights_dir, "vitb_backbone.pth")
+    if not os.path.exists(vitb_weight_file):
+        print("Downloading ViT-b backbone weights from Hugging Face...")
+        hf_hub_download(repo_id=repo_id, filename="dinov2_vitb14_reg4_pretrain.pth", local_dir=model_weights_dir, local_dir_use_symlinks=False)
+    # Seg head
+    if use_temporal:
+        seg_file = "ml4ded_seg_temporal.pth"
+    else:
+        seg_file = "ml4ded_seg.pth"
+    seg_weight_file = os.path.join(model_weights_dir, seg_file)
+    if not os.path.exists(seg_weight_file):
+        print(f"Downloading {seg_file} from Hugging Face...")
+        hf_hub_download(repo_id=repo_id, filename=seg_file, local_dir=model_weights_dir, local_dir_use_symlinks=False)
+
+
 def main():
     args = parse_args()
     target_class = SegLabels.CURRENT_PART.value
 
-    device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+    device = args.device
+
+    frames_to_process = []
+    enable_temporal = bool(args.video or args.image_dir)
+
+    if args.video:
+        from ml4ded.util.img_vid_utils.video_cropping import crop_and_save_video
+        video_path = args.video
+        video_dir = os.path.dirname(video_path)
+        tmp_img_dir = os.path.join(video_dir, 'tmp')
+        os.makedirs(tmp_img_dir, exist_ok=True)
+        _, frames_to_process = crop_and_save_video(input_video=video_path, output_dir=tmp_img_dir, stride=10)
+
+    elif args.image_dir:
+        dir_path = args.image_dir
+        files = os.listdir(dir_path)
+
+        frames_to_process = [os.path.join(dir_path, f) for f in files]
+    elif args.image:
+        frames_to_process = [args.image]
+    else:
+        print("No image, image directory, or video specified")
+        exit(0)
+
+    download_weights_if_needed(args.model_weights_dir, use_temporal=enable_temporal)
 
     # Load model
-    sample_img = Image.open(next(iter(os.scandir(args.image_dir))).path).convert('RGB')
+    sample_img = Image.open(frames_to_process[0]).convert('RGB')
     img_w, img_h = make_divisible(sample_img.size)
 
-    model = SegmentationDeformableDepth(
-        encoder="vitb",
-        num_classes=6,
-        image_height=img_h,
-        image_width=img_w,
-        features=768,
-        out_channels=[256, 512, 1024, 1024],
-        model_weights_dir=args.model_weights_dir,
-        device=device,
-    )
+    if enable_temporal:
+        model = Dino2Seg(
+            encoder="vitb",
+            num_classes=len(SegLabels),
+            image_height=img_h,
+            image_width=img_w,
+            features=768,
+            out_channels=[256, 512, 1024, 1024],
+            model_weights_dir=args.model_weights_dir,
+            use_clstoken=True,
+            use_temporal_consistency=True,
+            num_temporal_tokens=16,
+            temporal_window=4,
+            cross_attn_heads=4,
+            device=device,
+        )
+    else:
+        model = Dino2Seg(
+            encoder="vitb",
+            num_classes=len(SegLabels),
+            image_height=img_h,
+            image_width=img_w,
+            features=768,
+            out_channels=[256, 512, 1024, 1024],
+            model_weights_dir=args.model_weights_dir,
+            use_clstoken=True,
+            use_temporal_consistency=False,
+            num_temporal_tokens=0,
+            temporal_window=0,
+            cross_attn_heads=0,
+            device=device,
+        )
+
     model.eval().to(device)
 
     input_transform = transforms.Compose([
@@ -79,29 +153,27 @@ def main():
     frame_names = []
     overlays = []
 
-    frames = sorted(os.scandir(args.image_dir), key=lambda x: x.name)
-
-    for i, entry in enumerate(frames, 1):
-        if not entry.name.lower().endswith(('.jpg', '.png', '.jpeg')):
+    for i, entry in enumerate(frames_to_process, 1):
+        if not entry.endswith(('.jpg', '.png', '.jpeg')):
             continue
 
-        if i % 10 != 0:
-            continue
-
-        raw_img = Image.open(entry.path).convert('RGB')
+        raw_img = Image.open(entry).convert('RGB')
         transformed_image = input_transform(raw_img).unsqueeze(0).to(device)
 
         with torch.no_grad():
+            start_time = time.time()
             _, seg_map = model.infer_image(transformed_image)
+            end_time = time.time()
+            print(f"Inference time: {end_time - start_time}")
 
         seg_map_np = seg_map[0]
         height_px = compute_object_height(seg_map_np, target_class)
 
         if height_px is None:
-            print(f"{entry.name}: No CURRENT_PART detected. Skipping.")
+            print(f"{os.path.basename(entry)}: No CURRENT_PART detected. Skipping.")
             continue
 
-        frame_names.append(entry.name)
+        frame_names.append(entry)
         frame_heights.append(height_px)
 
         img_np = np.array(raw_img.resize((img_w, img_h)))

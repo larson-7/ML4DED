@@ -246,6 +246,7 @@ class Dino2Seg(nn.Module):
         self.pretrained = DINOv2(model_name=encoder)
         self.device = device
         self.use_clstoken = use_clstoken
+
         # ──────────────── WEIGHT LOADING LOGIC ──────────────── #
         vitb_weight_file = None
         seg_weight_file = None
@@ -256,8 +257,19 @@ class Dino2Seg(nn.Module):
             for f in files:
                 if "vitb" in f and (f.endswith(".pth") or f.endswith(".pt")):
                     vitb_weight_file = os.path.join(model_weights_dir, f)
-                if "seg" in f and (f.endswith(".pth") or f.endswith(".pt")):
-                    seg_weight_file = os.path.join(model_weights_dir, f)
+            # Find segmentation head weights
+            if use_temporal_consistency:
+                # Strict: look for _temporal.pth or _temporal.pt at the end
+                for f in files:
+                    if f.endswith("_temporal.pth") or f.endswith("_temporal.pt"):
+                        seg_weight_file = os.path.join(model_weights_dir, f)
+                        break
+            else:
+                # Any seg*.pth/pt (ignore _temporal)
+                for f in files:
+                    if "seg" in f and (f.endswith(".pth") or f.endswith(".pt")) and not f.endswith("_temporal.pth") and not f.endswith("_temporal.pt"):
+                        seg_weight_file = os.path.join(model_weights_dir, f)
+                        break
 
         # Load backbone weights if available
         if vitb_weight_file:
@@ -294,7 +306,6 @@ class Dino2Seg(nn.Module):
 
             if missing_keys:
                 print("[SegHead] Missing keys:", missing_keys)
-
                 # Reinitialize only submodules that have missing weights
                 modules_to_init = set(k.split('.')[0] for k in missing_keys)
                 for name, module in self.seg_head.named_children():
@@ -305,7 +316,10 @@ class Dino2Seg(nn.Module):
             if unexpected_keys:
                 print("[SegHead] Unexpected keys:", unexpected_keys)
         else:
-            print("No segmentation head weights found.")
+            if use_temporal_consistency:
+                print("No temporal segmentation head weights found (no *_temporal.pth/pt file).")
+            else:
+                print("No segmentation head weights found.")
 
         self.pretrained.to(self.device)
         self.seg_head.to(self.device)
@@ -327,7 +341,7 @@ class Dino2Seg(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, previous_temporal_tokens):
+    def forward(self, x, previous_temporal_tokens=None):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
 
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder],
@@ -344,7 +358,7 @@ class Dino2Seg(nn.Module):
 
     @torch.no_grad()
     def infer_image(self, image):
-        seg_logits = self.forward(image)
+        seg_logits, _, _ = self.forward(image)
         seg_probs = F.softmax(seg_logits, dim=1)
         segmentation_pred = torch.argmax(seg_probs, dim=1)
 
