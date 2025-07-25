@@ -1,5 +1,6 @@
 import math
 import os
+from collections import deque
 
 import cv2
 import torch
@@ -321,6 +322,9 @@ class Dino2Seg(nn.Module):
             else:
                 print("No segmentation head weights found.")
 
+        if use_temporal_consistency:
+            self.temporal_token_buffer = deque(maxlen=temporal_window)
+
         self.pretrained.to(self.device)
         self.seg_head.to(self.device)
 
@@ -341,6 +345,10 @@ class Dino2Seg(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
+    def reset_temporal_buffer(self):
+        if hasattr(self, "temporal_token_buffer"):
+            self.temporal_token_buffer.clear()
+
     def forward(self, x, previous_temporal_tokens=None):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
 
@@ -357,8 +365,27 @@ class Dino2Seg(nn.Module):
         return seg_logits.squeeze(1), temporal_tokens, attn_weights
 
     @torch.no_grad()
-    def infer_image(self, image):
-        seg_logits, _, _ = self.forward(image)
+    def infer_image(self, image: torch.Tensor):
+        """
+        Args:
+            image: (1, 3, H, W) tensor
+        Returns:
+            seg_probs: (1, C, H, W)
+            segmentation_pred: (1, H, W) numpy array
+        """
+        previous_temporal_tokens = None
+        if self.seg_head.use_temporal_consistency and len(self.temporal_token_buffer) > 0:
+            # Stack into (1, T * num_tokens, C)
+            buffer_tokens = torch.cat(list(self.temporal_token_buffer), dim=1)  # [(1, num_tokens, C), ...]
+            previous_temporal_tokens = buffer_tokens
+
+        seg_logits, temporal_tokens, _ = self.forward(image, previous_temporal_tokens)
+
+        # Update the buffer with the current frame's tokens
+        if self.seg_head.use_temporal_consistency and temporal_tokens is not None:
+            # (1, C, num_tokens) → (1, num_tokens, C)
+            self.temporal_token_buffer.append(temporal_tokens.permute(0, 2, 1).detach().cpu().to(self.device))
+
         seg_probs = F.softmax(seg_logits, dim=1)
         segmentation_pred = torch.argmax(seg_probs, dim=1)
 

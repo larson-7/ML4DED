@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import time
 
 import numpy as np
@@ -7,7 +8,7 @@ from PIL import Image
 import torch
 from torchvision import transforms
 import matplotlib
-
+import re
 matplotlib.use('tkAgg')
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
@@ -33,6 +34,8 @@ def parse_args():
     input_group.add_argument('--image-dir', type=str, default="", help='Directory of input images')
     parser.add_argument('--model-weights-dir', type=str, default="./model_weights", help='Pretrained model weights directory')
     parser.add_argument('--expected-height-mm', type=float, required=True, help='Expected real-world height (mm) of the final part (CURRENT_PART)')
+    parser.add_argument('--enable-temporal', action='store_true', help='Enable temporal consistency')
+    parser.add_argument('--frame-stride', default=15, help='number of frames to skip for each processed frame')
     parser.add_argument('--device', default='cpu', help='Training device')
     return parser.parse_args()
 
@@ -57,12 +60,13 @@ def overlay_segmentation(image_np, seg_map, alpha=0.5):
 
 def download_weights_if_needed(model_weights_dir, use_temporal, repo_id="iknocodes/ml4ded"):
     from huggingface_hub import hf_hub_download
+    vitb_model_name = "dinov2_vitb14_reg4_pretrain.pth"
     os.makedirs(model_weights_dir, exist_ok=True)
     # Check for backbone
-    vitb_weight_file = os.path.join(model_weights_dir, "vitb_backbone.pth")
+    vitb_weight_file = os.path.join(model_weights_dir, vitb_model_name)
     if not os.path.exists(vitb_weight_file):
         print("Downloading ViT-b backbone weights from Hugging Face...")
-        hf_hub_download(repo_id=repo_id, filename="dinov2_vitb14_reg4_pretrain.pth", local_dir=model_weights_dir, local_dir_use_symlinks=False)
+        hf_hub_download(repo_id=repo_id, filename=vitb_model_name, local_dir=model_weights_dir, local_dir_use_symlinks=False)
     # Seg head
     if use_temporal:
         seg_file = "ml4ded_seg_temporal.pth"
@@ -77,11 +81,11 @@ def download_weights_if_needed(model_weights_dir, use_temporal, repo_id="iknocod
 def main():
     args = parse_args()
     target_class = SegLabels.CURRENT_PART.value
-
+    frame_stride = 10
     device = args.device
 
     frames_to_process = []
-    enable_temporal = bool(args.video or args.image_dir)
+    enable_temporal = args.enable_temporal
 
     if args.video:
         from ml4ded.util.img_vid_utils.video_cropping import crop_and_save_video
@@ -89,13 +93,27 @@ def main():
         video_dir = os.path.dirname(video_path)
         tmp_img_dir = os.path.join(video_dir, 'tmp')
         os.makedirs(tmp_img_dir, exist_ok=True)
-        _, frames_to_process = crop_and_save_video(input_video=video_path, output_dir=tmp_img_dir, stride=10)
+        _, frames_to_process = crop_and_save_video(input_video=video_path, output_dir=tmp_img_dir, stride=frame_stride)
 
     elif args.image_dir:
         dir_path = args.image_dir
         files = os.listdir(dir_path)
 
-        frames_to_process = [os.path.join(dir_path, f) for f in files]
+        # Extract numeric prefix (e.g., 60.1 from '60.1.png') and sort
+        numbered_files = []
+        for f in files:
+            match = re.match(r"(\d+(?:\.\d+)?).*", f)
+            if match:
+                number = float(match.group(1))
+                numbered_files.append((number, f))
+
+        # Sort by the numeric value
+        numbered_files.sort(key=lambda x: x[0])
+
+        # Apply stride
+        selected_files = [fname for _, fname in numbered_files[::frame_stride]]
+
+        frames_to_process = [os.path.join(dir_path, f) for f in selected_files]
     elif args.image:
         frames_to_process = [args.image]
     else:
@@ -152,6 +170,7 @@ def main():
     frame_heights = []
     frame_names = []
     overlays = []
+    num_frames = len(frames_to_process)
 
     for i, entry in enumerate(frames_to_process, 1):
         if not entry.endswith(('.jpg', '.png', '.jpeg')):
@@ -164,7 +183,7 @@ def main():
             start_time = time.time()
             _, seg_map = model.infer_image(transformed_image)
             end_time = time.time()
-            print(f"Inference time: {end_time - start_time}")
+            print(f"Frame {i}/{num_frames} processed in: {(end_time - start_time):.3f} seconds")
 
         seg_map_np = seg_map[0]
         height_px = compute_object_height(seg_map_np, target_class)
@@ -193,7 +212,7 @@ def main():
     fig, axs = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [2, 3]})
     plt.subplots_adjust(bottom=0.25)
 
-    frame_names = ["." + x.replace(x.split(".")[-1], "") for x in frame_names]
+    frame_names = [os.path.basename(x).replace("." + os.path.basename(x).split(".")[-1], "") for x in frame_names]
     frame_heights_mm = np.array(frame_heights) * scale_mm_per_px
     # Plot height vs frame
     axs[0].plot(range(len(frame_names)), frame_heights_mm, marker='o')
@@ -230,6 +249,15 @@ def main():
 
     plt.tight_layout()
     plt.show()
+
+    # ─────────────── CLEANUP TEMPORARY DIRECTORY ─────────────── #
+    if args.video:
+        try:
+            shutil.rmtree(tmp_img_dir)
+            print(f"Temporary directory {tmp_img_dir} deleted.")
+        except Exception as e:
+            print(f"Failed to delete temporary directory {tmp_img_dir}: {e}")
+
 
 if __name__ == '__main__':
     main()
