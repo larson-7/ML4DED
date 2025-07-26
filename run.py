@@ -16,6 +16,7 @@ matplotlib.use('tkAgg')
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
 from enum import Enum
+import matplotlib.cm as cm
 
 from ml4ded.models.dino2seg import Dino2Seg
 from ml4ded.util.vis import decode_segmap
@@ -39,7 +40,8 @@ def parse_args():
     parser.add_argument('--expected-height-mm', type=float, required=True, help='Expected real-world height (mm) of the final part (CURRENT_PART)')
     parser.add_argument('--enable-temporal', action='store_true', help='Enable temporal consistency')
     parser.add_argument('--frame-stride', default=15, help='number of frames to skip for each processed frame')
-    parser.add_argument('--device', default='cpu', help='Training device')
+    parser.add_argument('--device', default='cuda', help='Training device')
+    parser.add_argument('--color-layers', action='store_true', help='Color coordinate layers in plot')
     return parser.parse_args()
 
 def make_divisible(val, divisor=14):
@@ -62,6 +64,18 @@ def overlay_segmentation(image_np, seg_map, alpha=0.5):
     return overlay
 
 
+def group_layers_by_height(heights, threshold=0.2):
+    """Group frame indices into layers based on height changes."""
+    layers = []
+    current_layer = [0]
+    for i in range(1, len(heights)):
+        if abs(heights[i] - heights[i-1]) > threshold:
+            layers.append(current_layer)
+            current_layer = [i]
+        else:
+            current_layer.append(i)
+    layers.append(current_layer)
+    return layers
 
 def main():
     args = parse_args()
@@ -199,13 +213,41 @@ def main():
 
     frame_names = [os.path.basename(x).replace("." + os.path.basename(x).split(".")[-1], "") for x in frame_names]
     frame_heights_mm = np.array(frame_heights) * scale_mm_per_px
-    # Plot height vs frame
-    axs[0].plot(range(len(frame_names)), frame_heights_mm, marker='o')
+
+    if args.color_layers:
+    # Group frames into layers and assign colors
+        threshold = 0.2  # mm, adjust as needed for your process
+        layers = group_layers_by_height(frame_heights_mm, threshold=threshold)
+        num_layers = len(layers)
+        colors = cm.get_cmap('tab20', num_layers)
+
+        # Plot height vs frame, color by layer
+        for idx, layer in enumerate(layers):
+            axs[0].plot(
+                layer,
+                frame_heights_mm[layer],
+                marker='o',
+                color=colors(idx),
+                label=f'Layer {idx+1}'
+            )
+            # Optionally, plot mean line for each layer
+            mean_height = np.mean(frame_heights_mm[layer])
+            axs[0].plot(
+                [layer[0], layer[-1]],
+                [mean_height, mean_height],
+                color=colors(idx),
+                linestyle='--',
+                linewidth=2
+            )
+    else:
+        axs[0].plot(range(len(frame_names)), frame_heights_mm, marker='o')  
+
     axs[0].set_title('CURRENT_PART Height per Frame')
     axs[0].set_ylabel('Height (mm)')
     axs[0].set_xlabel('Image Name')
     axs[0].set_xticks(range(len(frame_names)))
     axs[0].set_xticklabels(frame_names, rotation=45, ha='right', fontsize=8)
+    axs[0].legend(loc='best', fontsize=8)
 
     # Display initial overlay
     overlay_ax = axs[1]
@@ -233,6 +275,7 @@ def main():
     frame_slider.on_changed(update)
 
     plt.tight_layout()
+    plt.savefig("no_temp_output_plot.png")
     plt.show()
 
     # ─────────────── CLEANUP TEMPORARY DIRECTORY ─────────────── #
@@ -242,7 +285,6 @@ def main():
             print(f"Temporary directory {tmp_img_dir} deleted.")
         except Exception as e:
             print(f"Failed to delete temporary directory {tmp_img_dir}: {e}")
-
 
 if __name__ == '__main__':
     main()
