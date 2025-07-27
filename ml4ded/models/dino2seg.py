@@ -37,7 +37,12 @@ class TemporalExtractor(nn.Module):
         x = self.temporal_conv(x)     # (B, C, N)
         x = F.relu(x)
 
-        x = self.temporal_pool(x)     # (B, C, num_tokens)
+        if x.device.type == "mps":
+            x = x.cpu()
+            x = self.temporal_pool(x)
+            x = x.to("mps")
+        else:
+            x = self.temporal_pool(x)     # (B, C, num_tokens)
         temporal_tokens = x.transpose(1, 2)  # (B, num_tokens, C)
 
         return temporal_tokens
