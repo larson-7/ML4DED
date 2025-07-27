@@ -129,7 +129,8 @@ def build_figure(data_dir, model_weights_dir, output_path=None):
 
         input_tensor = prepare_tensor(img, img_w, img_h).to(device)
         start_time = time.time()
-        pred_baseline = decode_segmap(run_model(baseline_model, input_tensor, device), nc=len(CLASS_NAMES))
+        with torch.no_grad():
+            pred_baseline = decode_segmap(run_model(baseline_model, input_tensor, device), nc=len(CLASS_NAMES))
         end_time = time.time()
         print(f"BASELINE - Vid: {vid_id} Frame: {frame_id} processed in: {(end_time - start_time):.3f} seconds")
 
@@ -169,7 +170,7 @@ def build_figure(data_dir, model_weights_dir, output_path=None):
             if c == 0:
                 ax.set_ylabel(row_labels[r], fontsize=12, rotation=0, labelpad=40, ha='right', va='center')
 
-    temporal_model.reset_temporal_buffer()
+        temporal_model.reset_temporal_buffer()
 
     # Adjust layout to leave room for the legend
     fig.subplots_adjust(left=0.05, right=0.98, top=0.95, bottom=0.20, wspace=0.02, hspace=0.02)
