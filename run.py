@@ -379,10 +379,14 @@ def main():
         # Define layers based on height increases
         layers = []
         current_layer = [0]
-        
+
+        threshold = 0.2  # mm
+        layers = []
+        current_layer = [0]
+
         for i in range(1, len(heights_for_layers)):
-            # If height increased significantly, mark as a new layer
-            if heights_for_layers[i] > heights_for_layers[i-1] + 0.1:  # 0.1mm threshold
+            current_avg = np.mean([heights_for_layers[j] for j in current_layer])
+            if heights_for_layers[i] > current_avg + threshold:
                 layers.append(current_layer)
                 current_layer = [i]
             else:
