@@ -39,7 +39,7 @@ A custom Dense Prediction Transformer (DPT)-style decoder reconstructs spatially
 
 ### Temporal Module
 
-To enhance segmentation consistency, the Temporal Deformable Dense Prediction Task (TDDPT) extends the model by including temporal memory tokens processed by an additional cross-attention mechanism. This significantly improves segmentation performance by incorporating temporal and spatial context.
+To enhance segmentation consistency, the Temporal Dense Prediction Task (TDPT) extends the model by including temporal memory tokens processed by an additional cross-attention mechanism. This significantly improves segmentation performance by incorporating temporal and spatial context.
 
 ## Dataset and Annotations
 
@@ -65,7 +65,7 @@ Model weights, data labels, and raw videos can be found at the partner [HuggingF
 To train the model:
 
 ```bash
-python train.py --config configs/train_config.yaml
+python train.py --batch-size 6 --device cuda --epochs 20
 ```
 
 ### Inference
