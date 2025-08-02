@@ -55,6 +55,9 @@ cd ml4ded
 pip install -r requirements.txt
 ```
 
+## Data
+Model weights, data labels, and raw videos can be found at the partner [HuggingFace repo](https://huggingface.co/iknocodes/ml4ded)
+
 ## Usage
 
 ### Training
