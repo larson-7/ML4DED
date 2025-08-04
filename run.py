@@ -17,10 +17,10 @@ from datetime import datetime
 from enum import Enum
 
 from ml4ded.models.dino2seg import Dino2Seg
-from utils.image_processing import process_frames, apply_filtering
-from utils.layer_detection import group_layers_by_height, convert_layers_to_ids
-from utils.visualization import create_visualization, get_output_filename
-from utils.metrics import compute_temporal_metrics, analyze_layer_metrics, detect_anomalies
+from ml4ded.run_utils.image_processing import process_frames, apply_filtering
+from ml4ded.run_utils.layer_detection import group_layers_by_height, convert_layers_to_ids
+from ml4ded.run_utils.visualization import create_visualization, get_output_filename
+from ml4ded.run_utils.metrics import compute_temporal_metrics, analyze_layer_metrics, detect_anomalies
 
 class SegLabels(Enum):
     BACKGROUND = 0
@@ -84,7 +84,7 @@ def load_input_frames(args):
     frame_stride = args.frame_stride
     
     if args.video:
-        from ml4ded.util.img_vid_utils.video_cropping import crop_and_save_video
+        from ml4ded.data_processing.preparation.video_cropping import crop_and_save_video
         video_path = args.video
         video_dir = os.path.dirname(video_path)
         tmp_img_dir = os.path.join(video_dir, 'tmp')

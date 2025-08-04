@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ml4ded.dinov2.dinov2 import DINOv2
-from ml4ded.models.blocks import FeatureFusionBlock, _make_scratch
+from ..dinov2.dinov2_transformer import DINOv2
+from .blocks import FeatureFusionBlock, _make_scratch
 import torch.nn.init as init
 
 class TemporalExtractor(nn.Module):

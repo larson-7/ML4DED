@@ -5,7 +5,7 @@ import torch
 
 from PIL import Image
 from scipy.ndimage import median_filter, label
-from ml4ded.util.vis import decode_segmap
+from ml4ded.data_processing.vis import decode_segmap
 
 def compute_object_height(seg_map, target_class, conf_map=None, threshold=0.5, min_area_pct=0.05):
     """

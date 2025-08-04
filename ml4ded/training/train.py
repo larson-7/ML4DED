@@ -14,12 +14,12 @@ cur_path = os.path.abspath(os.path.dirname(__file__))
 root_path = os.path.split(cur_path)[0]
 sys.path.append(root_path)
 
-from ml4ded.models.dino2seg import Dino2Seg
-from ml4ded.util.training.segmentationMetric import *
-from ml4ded.util.vis import decode_segmap
-from ml4ded.util.dataset.ml4ded_seg_dataset import ML4DEDSegmentationDataset
-from ml4ded.util.training.early_stopping import EarlyStopping
-from ml4ded.util.dataset.augmentations.augmentations import get_train_augmentation, get_val_augmentation
+from models.dino2seg import Dino2Seg
+from training.segmentationMetric import *
+from data_processing.vis import decode_segmap
+from data_processing.dataset.ml4ded_seg_dataset import ML4DEDSegmentationDataset
+from early_stopping import EarlyStopping
+from data_processing.preprocessing.augmentations import get_train_augmentation, get_val_augmentation
 
 
 class SegLabels(Enum):
@@ -336,9 +336,14 @@ def save_checkpoint(model, args, is_best=False):
 
 if __name__ == '__main__':
     args = parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-    args.device = "cuda"
+    if torch.cuda.is_available():
+        args.device = "cuda"
+    elif torch.backends.mps.is_available():
+        args.device = "mps"
+    else:
+        args.device = "cpu"
     writer = SummaryWriter()
     trainer = Trainer(args)
     trainer.train()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
