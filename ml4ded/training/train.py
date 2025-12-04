@@ -10,6 +10,7 @@ import torch.utils.data as data
 from torch.utils.tensorboard import SummaryWriter
 import torchvision
 
+# Assuming your directory structure requires this path appending
 cur_path = os.path.abspath(os.path.dirname(__file__))
 root_path = os.path.split(cur_path)[0]
 sys.path.append(root_path)
@@ -19,7 +20,10 @@ from training.segmentationMetric import *
 from data_processing.vis import decode_segmap
 from data_processing.dataset.ml4ded_seg_dataset import ML4DEDSegmentationDataset
 from early_stopping import EarlyStopping
-from data_processing.preprocessing.augmentations import get_train_augmentation, get_val_augmentation
+from data_processing.preprocessing.augmentations import (
+    get_train_augmentation,
+    get_val_augmentation,
+)
 
 
 class SegLabels(Enum):
@@ -30,26 +34,44 @@ class SegLabels(Enum):
     CURRENT_PART = 4
     WELD_FLASH = 5
 
+
 def parse_args():
-    parser = argparse.ArgumentParser(description='Semantic Segmentation Training With Pytorch')
-    parser.add_argument('--data-dir', type=str, default="./data/ml4ded",
-                        help='train/test data directory')
-    parser.add_argument('--model-weights-dir', type=str, default="./model_weights",
-                        help='pretrained model weights directory')
+    parser = argparse.ArgumentParser(
+        description="Semantic Segmentation Training With Pytorch"
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="./data/ml4ded",
+        help="train/test data directory",
+    )
+    parser.add_argument(
+        "--model-weights-dir",
+        type=str,
+        default="./model_weights",
+        help="pretrained model weights directory",
+    )
 
-    parser.add_argument('--base-size', type=int, default=580,
-                        help='base image size')
-    parser.add_argument('--crop-size', type=int, default=518,
-                        help='crop image size')
+    parser.add_argument("--base-size", type=int, default=580, help="base image size")
+    parser.add_argument("--crop-size", type=int, default=518, help="crop image size")
 
-    parser.add_argument('--batch-size', type=int, default=6, metavar='N',
-                        help='input batch size for training')
-    parser.add_argument('--epochs', type=int, default=100, metavar='N',
-                        help='number of epochs to train')
-    parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
-                        help='learning rate')
-    parser.add_argument('--save-dir', default='./ckpt', help='Directory for saving checkpoint models')
-    parser.add_argument('--device', default='cuda', help='Training device')
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=6,
+        metavar="N",
+        help="input batch size for training",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=100, metavar="N", help="number of epochs to train"
+    )
+    parser.add_argument(
+        "--lr", type=float, default=1e-4, metavar="LR", help="learning rate"
+    )
+    parser.add_argument(
+        "--save-dir", default="./ckpt", help="Directory for saving checkpoint models"
+    )
+    parser.add_argument("--device", default="cuda", help="Training device")
     return parser.parse_args()
 
 
@@ -65,7 +87,8 @@ class Trainer(object):
 
         dataset_class = ML4DEDSegmentationDataset
         default_data_dir = os.path.join(root_path, "data/ml4ded")
-        # Adapt to your actual image size
+
+        # Adapt to your actual image size (Must be divisible by 14 for ViT)
         img_h, img_w = make_divisible(1072), make_divisible(608)
 
         data_dir = args.data_dir if args.data_dir else default_data_dir
@@ -74,13 +97,32 @@ class Trainer(object):
         train_transform = get_train_augmentation(img_h, img_w)
         val_transform = get_val_augmentation(img_h, img_w)
 
-        temporal_window = 4
-        # dataset and dataloader
-        trainset = dataset_class(data_dir, split="train", mode="train", temporal_window=temporal_window, transform=train_transform)
-        valset = dataset_class(data_dir, split="test", mode="val",temporal_window=temporal_window,  transform=val_transform)
-        
-        self.train_loader = data.DataLoader(dataset=trainset, batch_size=args.batch_size, pin_memory=True)
-        self.val_loader = data.DataLoader(dataset=valset, batch_size=args.batch_size, pin_memory=True)
+        # Temporal settings
+        self.temporal_window = 4
+
+        # Dataset and Dataloader
+        # Ensure your dataset returns (B, T, 3, H, W)
+        trainset = dataset_class(
+            data_dir,
+            split="train",
+            mode="train",
+            temporal_window=self.temporal_window,
+            transform=train_transform,
+        )
+        valset = dataset_class(
+            data_dir,
+            split="test",
+            mode="val",
+            temporal_window=self.temporal_window,
+            transform=val_transform,
+        )
+
+        self.train_loader = data.DataLoader(
+            dataset=trainset, batch_size=args.batch_size, pin_memory=True, shuffle=True
+        )
+        self.val_loader = data.DataLoader(
+            dataset=valset, batch_size=args.batch_size, pin_memory=True, shuffle=False
+        )
 
         self.model = Dino2Seg(
             encoder="vitb",
@@ -93,11 +135,12 @@ class Trainer(object):
             use_clstoken=True,
             use_temporal_consistency=True,
             num_temporal_tokens=16,
-            temporal_window=temporal_window,
+            temporal_window=self.temporal_window,
             cross_attn_heads=4,
             device=self.device,
         )
 
+        # Class Weight Setup
         class_weights = []
         for seg_label in SegLabels:
             match seg_label.name:
@@ -133,19 +176,24 @@ class Trainer(object):
             # Unfreeze only temporal-related parameters
             temporal_params = []
 
-            # Unfreeze temporal tokens if they exist
-            if hasattr(self.model.seg_head, 'temporal_extractor'):
+            if hasattr(self.model.seg_head, "temporal_extractor"):
                 for param in self.model.seg_head.temporal_extractor.parameters():
                     param.requires_grad = True
                     temporal_params.append(param)
 
-            if hasattr(self.model.seg_head, 'gate'):
+            if hasattr(self.model.seg_head, "gate"):
                 param = self.model.seg_head.gate
                 param.requires_grad = True
                 temporal_params.append(param)
 
-            # Unfreeze cross-attention layers for temporal processing
-            if hasattr(self.model.seg_head, 'cross_attn_block'):
+            # --- NEW: Train the learnable cold start token ---
+            if hasattr(self.model.seg_head, "init_temporal_tokens"):
+                param = self.model.seg_head.init_temporal_tokens
+                param.requires_grad = True
+                temporal_params.append(param)
+
+            # Unfreeze cross-attention layers
+            if hasattr(self.model.seg_head, "cross_attn_block"):
                 for param in self.model.seg_head.cross_attn_block.parameters():
                     param.requires_grad = True
                     temporal_params.append(param)
@@ -162,14 +210,13 @@ class Trainer(object):
 
             # Unfreeze all parameters (except encoder which stays frozen)
             for name, param in self.model.named_parameters():
-                if 'pretrained' not in name.lower():  # Keep encoder frozen
+                if "pretrained" not in name.lower():  # Keep encoder frozen
                     param.requires_grad = True
 
             # Create optimizer with all trainable parameters with a reduced learning rate
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            self.optimizer = torch.optim.AdamW(trainable_params, lr=self.args.lr/10)
+            self.optimizer = torch.optim.AdamW(trainable_params, lr=self.args.lr / 10)
             print(f"Training {len(trainable_params)} total parameters")
-
 
     def train(self):
         iteration = 0
@@ -189,23 +236,23 @@ class Trainer(object):
                 iteration += 1
                 num_batches += 1
 
-                # images: (B, T, 3, H, W), targets: (B, T, H, W)
+                # images: (B, T, 3, H, W)
+                # targets: (B, T, H, W)
                 images = images.to(self.device)
                 targets = targets.to(self.device)
 
-                current_images = images[:, -1]  # (B, 3, H, W)
-                current_targets = targets[:, -1]  # (B, H, W)
+                # --- NEW: Forward Clip (Efficient Training) ---
+                # This runs the backbone once for B*T images, then unrolls the loop
+                # Output shape: (B, T, NumClasses, H, W)
+                outputs = self.model.forward_clip(images)
 
-                prev_temporal_images = images[:, :-1]  # (B, T-1, 3, H, W)
-                prev_temporal_images = prev_temporal_images.permute(1, 0, 2, 3, 4)  # (T-1, B, 3, H, W)
+                # Reshape for loss calculation: Flatten Batch and Time
+                # (B*T, NumClasses, H, W)
+                B, T, C, H, W = outputs.shape
+                flat_outputs = outputs.view(B * T, C, H, W)
+                flat_targets = targets.view(B * T, H, W)
 
-                previous_temporal_tokens = self.model.get_previous_temporal_tokens(prev_temporal_images)
-
-                outputs, temporal_tokens , attn_weights= self.model(current_images, previous_temporal_tokens)  # shape (B, C, H, W)
-                pred = torch.max(outputs, 1).indices
-
-                loss = self.criterion(outputs, current_targets)
-                loss = torch.mean(loss)
+                loss = self.criterion(flat_outputs, flat_targets)
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -214,50 +261,99 @@ class Trainer(object):
                 avg_loss += loss
                 epoch_loss += loss.item()
 
+                # --- Visualization (Every 100 iters) ---
                 if iteration % 100 == 0:
-                    patch_h, patch_w = current_images.shape[-2] // 14, current_images.shape[-1] // 14
-                    print(f"epoch {i + 1} | iteration {iteration}: loss = {avg_loss.item() / 100:.4f}")
-                    writer.add_scalar('training loss', avg_loss.item() / 100, iteration)
-                    writer.add_scalar('temporal_gate', self.model.seg_head.gate.item(), iteration)
+                    print(
+                        f"epoch {i + 1} | iteration {iteration}: loss = {avg_loss.item() / 100:.4f}"
+                    )
+                    writer.add_scalar("training loss", avg_loss.item() / 100, iteration)
+                    if hasattr(self.model.seg_head, "gate"):
+                        writer.add_scalar(
+                            "temporal_gate", self.model.seg_head.gate.item(), iteration
+                        )
 
-                    # ---------- TEMPORAL TOKENS ----------
-                    temporal_tokens_vis = temporal_tokens[0].detach().cpu()  # (C, N_temp)
-                    writer.add_image("temporal_tokens/heatmap", temporal_tokens_vis.unsqueeze(0), iteration)
-                    writer.add_histogram("temporal_tokens/hist", temporal_tokens.detach().cpu(), iteration)
+                    # Get Visuals from LAST frame only
+                    # We run a single forward pass on the last frame to grab attention weights
+                    # purely for visualization.
+                    with torch.no_grad():
+                        last_frame = images[:, -1]
+                        # Use cold start just to see the structure, or pass None
+                        _, temporal_tokens, attn_weights = self.model(
+                            last_frame, previous_temporal_tokens=None
+                        )
 
-                    # ---------- TEMPORAL ATTENTION (Single Head) ----------
-                    # attn_weights: (B, N_query, N_key)
-                    attn_weights_b0 = attn_weights[0].detach().cpu()  # (N_query, N_key)
+                    if temporal_tokens is not None:
+                        # ---------- TEMPORAL TOKENS ----------
+                        # temporal_tokens: (B, N_temp, C)
+                        temporal_tokens_vis = (
+                            temporal_tokens[0].detach().cpu().T
+                        )  # (C, N_temp)
+                        writer.add_image(
+                            "temporal_tokens/heatmap",
+                            temporal_tokens_vis.unsqueeze(0),
+                            iteration,
+                        )
+                        writer.add_histogram(
+                            "temporal_tokens/hist",
+                            temporal_tokens.detach().cpu(),
+                            iteration,
+                        )
 
-                    N_cls = 1 if self.model.use_clstoken else 0
-                    N_spatial = patch_h * patch_w
-                    temporal_start = N_cls + N_spatial
+                    if attn_weights is not None:
+                        # ---------- TEMPORAL ATTENTION (Single Head) ----------
+                        # attn_weights: (B, N_query, N_key)
+                        attn_weights_b0 = (
+                            attn_weights[0].detach().cpu()
+                        )  # (N_query, N_key)
 
-                    # Extract temporal token rows only
-                    temporal_attn = attn_weights_b0[temporal_start:, :]  # (N_temp, N_key)
+                        N_cls = 1 if self.model.use_clstoken else 0
+                        patch_h = H // 14
+                        patch_w = W // 14
+                        N_spatial = patch_h * patch_w
+                        temporal_start = N_cls + N_spatial
 
-                    # Normalize for visualization
-                    temporal_attn_norm = (temporal_attn - temporal_attn.min()) / (
-                                temporal_attn.max() - temporal_attn.min() + 1e-6)
-                    temporal_attn_img = temporal_attn_norm.unsqueeze(0)  # (1, 1, N_temp, N_key)
-                    temporal_attn = temporal_attn.unsqueeze(0)
+                        # Extract temporal token rows only (Attention of temporal tokens paying attn to history)
+                        if attn_weights_b0.shape[0] > temporal_start:
+                            temporal_attn = attn_weights_b0[
+                                temporal_start:, :
+                            ]  # (N_temp, N_key)
 
-                    writer.add_image("attention_weights/temporal_only", temporal_attn_img, iteration)
-                    writer.add_histogram("attention_weights/temporal_only_hist", temporal_attn, iteration)
+                            # Normalize for visualization
+                            temporal_attn_norm = (
+                                temporal_attn - temporal_attn.min()
+                            ) / (temporal_attn.max() - temporal_attn.min() + 1e-6)
+                            temporal_attn_img = temporal_attn_norm.unsqueeze(
+                                0
+                            )  # (1, 1, N_temp, N_key)
+
+                            writer.add_image(
+                                "attention_weights/temporal_only",
+                                temporal_attn_img,
+                                iteration,
+                            )
+                            writer.add_histogram(
+                                "attention_weights/temporal_only_hist",
+                                temporal_attn,
+                                iteration,
+                            )
 
                     avg_loss = 0  # Reset loss accumulator
+
+                # Image logging
                 if iteration % 500 == 1:
-                    pred_img = decode_segmap(pred[0].cpu().data.numpy())
-                    gt_img = decode_segmap(targets[0, -1].cpu().data.numpy())  # Use current target
+                    # Log the last frame of the batch
+                    pred_last = torch.max(outputs[:, -1], 1).indices  # (B, H, W)
+                    pred_img = decode_segmap(pred_last[0].cpu().data.numpy())
+                    gt_img = decode_segmap(targets[0, -1].cpu().data.numpy())
                     pred_img = torch.from_numpy(pred_img).permute(2, 0, 1)
                     gt_img = torch.from_numpy(gt_img).permute(2, 0, 1)
                     writer.add_image("pred", pred_img, iteration)
                     writer.add_image("gt", gt_img, iteration)
 
-            # Log epoch statistics and final gate values for the epoch
+            # Log epoch statistics
             avg_epoch_loss = epoch_loss / num_batches
             print(f"Epoch {i + 1} average loss: {avg_epoch_loss:.4f}")
-            writer.add_scalar('epoch_loss', avg_epoch_loss, i)
+            writer.add_scalar("epoch_loss", avg_epoch_loss, i)
 
             # Validation
             val_metric = self.validation(iteration, i)
@@ -266,8 +362,6 @@ class Trainer(object):
             if self.early_stopper.early_stop:
                 print(f"Early stopping at epoch {i + 1}")
                 break
-
-
 
     def validation(self, it, e):
         is_best = False
@@ -279,71 +373,17 @@ class Trainer(object):
         self.metric.reset()
 
         for images, targets, _ in tqdm(self.val_loader):
-            images = images.to(self.device)  # (B, T, 3, H, W)
-            targets = targets.to(self.device)  # (B, T, H, W)
-
-            current_images = images[:, -1]  # (B, 3, H, W)
-            current_targets = targets[:, -1]  # (B, H, W)
-
-            prev_temporal_images = images[:, :-1]  # (B, T-1, 3, H, W)
-            prev_temporal_images = prev_temporal_images.permute(1, 0, 2, 3, 4)  # (T-1, B, 3, H, W)
+            # images: (B, T, 3, H, W)
+            # targets: (B, T, H, W)
+            images = images.to(self.device)
+            targets = targets.to(self.device)
 
             with torch.no_grad():
-                previous_temporal_tokens = self.model.get_previous_temporal_tokens(prev_temporal_images)
-                outputs, pred_tokens, attn_weights = self.model(current_images, previous_temporal_tokens)  # (B, C, H, W)
-                preds = torch.argmax(outputs, dim=1)  # (B, H, W)
+                # Use the efficient clip forward pass
+                outputs = self.model.forward_clip(images)  # (B, T, C, H, W)
 
-            self.metric.update(outputs, current_targets)
-            pixAcc, mIoU, weighted_mIoU = self.metric.get()
+                # Flatten to evaluate EVERY frame in the validation clip
+                B, T, C, H, W = outputs.shape
 
-            for i in range(preds.shape[0]):
-                if len(_preds) < 64:  # only log first few batches
-                    _preds.append(torchvision.transforms.ToTensor()(decode_segmap(preds[i].cpu().numpy())))
-                    _targets.append(torchvision.transforms.ToTensor()(decode_segmap(current_targets[i].cpu().numpy())))
-
-        _preds = torchvision.utils.make_grid(_preds, nrow=8)
-        _targets = torchvision.utils.make_grid(_targets, nrow=8)
-
-        new_pred = (pixAcc + mIoU) / 2
-        print(f"pixel acc: {pixAcc:.4f}\nmIoU: {mIoU:.4f}\nweighted mIoU: {weighted_mIoU:.4f}")
-        writer.add_scalar('validation pixAcc', pixAcc, it)
-        writer.add_scalar('validation mIoU', mIoU, it)
-        writer.add_scalar('validation weighted mIoU', weighted_mIoU, it)
-        # writer.add_image("val_gt", _targets, it)
-        # writer.add_image("val_pred", _preds, it)
-
-        if new_pred > self.best_pred:
-            is_best = True
-            self.best_pred = new_pred
-
-        save_checkpoint(self.model, self.args, is_best)
-        return new_pred
-
-
-def save_checkpoint(model, args, is_best=False):
-    """Save Checkpoint"""
-    directory = os.path.expanduser(args.save_dir)
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-    filename = f"dinov2_seg.pth"
-    filename = os.path.join(directory, filename)
-    torch.save(model.seg_head.state_dict(), filename)
-    if is_best:
-        best_filename = 'dinov2_seg_best_model.pth'
-        best_filename = os.path.join(directory, best_filename)
-        shutil.copyfile(filename, best_filename)
-
-
-if __name__ == '__main__':
-    args = parse_args()
-    if torch.cuda.is_available():
-        args.device = "cuda"
-    elif torch.backends.mps.is_available():
-        args.device = "mps"
-    else:
-        args.device = "cpu"
-    writer = SummaryWriter()
-    trainer = Trainer(args)
-    trainer.train()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+                flat_outputs = outputs.view(B * T, C, H, W)
+                flat_targets = targets.view(B * T, H, W)
