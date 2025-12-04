@@ -27,45 +27,66 @@ def _make_fusion_block(features, use_bn, size=None):
 
 
 class TemporalExtractor(nn.Module):
-    def __init__(self, embed_dim, num_temporal_tokens=4):
+    def __init__(self, embed_dim, num_temporal_tokens=16):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_temporal_tokens = num_temporal_tokens
-
-        self.temporal_conv = nn.Conv1d(
-            embed_dim,
-            embed_dim,
-            kernel_size=3,
-            padding=1,
-            groups=embed_dim,  # depthwise conv
-        )
-
-        self.temporal_pool = nn.AdaptiveAvgPool1d(num_temporal_tokens)
+        # Learnable queries that "ask" for specific info from the image
+        self.query_embed = nn.Parameter(torch.randn(1, num_temporal_tokens, embed_dim))
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads=4, batch_first=True)
 
     def forward(self, features):
-        """
-        Args:
-            features: (B, N_spatial, C)
-        Returns:
-            temporal_tokens: (B, num_temporal_tokens, C)
-        """
-        B, N, C = features.shape
+        # features: (B, N_spatial, C)
+        B = features.shape[0]
 
-        x = features.transpose(1, 2)  # (B, C, N)
-        x = self.temporal_conv(x)  # (B, C, N)
-        x = F.relu(x)
+        # Expand queries for batch
+        queries = self.query_embed.expand(B, -1, -1)
 
-        # MPS device check for adaptive pool compatibility
-        if x.device.type == "mps":
-            x = x.cpu()
-            x = self.temporal_pool(x)
-            x = x.to("mps")
-        else:
-            x = self.temporal_pool(x)  # (B, C, num_tokens)
+        # Attention: Queries look at the Spatial Features to extract info
+        # query=queries, key=features, value=features
+        out, _ = self.attn(queries, features, features)
 
-        temporal_tokens = x.transpose(1, 2)  # (B, num_tokens, C)
+        return out  # (B, num_temporal_tokens, C)
 
-        return temporal_tokens
+
+# class TemporalExtractor(nn.Module):
+#     def __init__(self, embed_dim, num_temporal_tokens=4):
+#         super().__init__()
+#         self.embed_dim = embed_dim
+#         self.num_temporal_tokens = num_temporal_tokens
+
+#         self.temporal_conv = nn.Conv1d(
+#             embed_dim,
+#             embed_dim,
+#             kernel_size=3,
+#             padding=1,
+#             groups=embed_dim,  # depthwise conv
+#         )
+
+#         self.temporal_pool = nn.AdaptiveAvgPool1d(num_temporal_tokens)
+
+#     def forward(self, features):
+#         """
+#         Args:
+#             features: (B, N_spatial, C)
+#         Returns:
+#             temporal_tokens: (B, num_temporal_tokens, C)
+#         """
+#         B, N, C = features.shape
+
+#         x = features.transpose(1, 2)  # (B, C, N)
+#         x = self.temporal_conv(x)  # (B, C, N)
+#         x = F.relu(x)
+
+#         # MPS device check for adaptive pool compatibility
+#         if x.device.type == "mps":
+#             x = x.cpu()
+#             x = self.temporal_pool(x)
+#             x = x.to("mps")
+#         else:
+#             x = self.temporal_pool(x)  # (B, C, num_tokens)
+
+#         temporal_tokens = x.transpose(1, 2)  # (B, num_tokens, C)
+
+#         return temporal_tokens
 
 
 class CrossAttentionBlock(nn.Module):
