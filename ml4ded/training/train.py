@@ -387,3 +387,18 @@ class Trainer(object):
 
                 flat_outputs = outputs.view(B * T, C, H, W)
                 flat_targets = targets.view(B * T, H, W)
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if torch.cuda.is_available():
+        args.device = "cuda"
+    elif torch.backends.mps.is_available():
+        args.device = "mps"
+    else:
+        args.device = "cpu"
+    writer = SummaryWriter()
+    trainer = Trainer(args)
+    trainer.train()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
