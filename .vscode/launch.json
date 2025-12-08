@@ -5,11 +5,38 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
             "name": "Launch dino2seg as a Module",
             "type": "python",
             "request": "launch",
             // Change "program" to "module" and use the dot-notation path:
             "module": "ml4ded.models.dino2seg",
+            // Crucial: Set the CWD to the parent directory of ml4ded/ (i.e., ML4DED/)
+            // The debugger needs to start from a directory where "ml4ded" is visible.
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Launch train.py as a Module",
+            "type": "python",
+            "request": "launch",
+            // Change "program" to "module" and use the dot-notation path:
+            "module": "ml4ded.training.train",
             // Crucial: Set the CWD to the parent directory of ml4ded/ (i.e., ML4DED/)
             // The debugger needs to start from a directory where "ml4ded" is visible.
             "cwd": "${workspaceFolder}"
