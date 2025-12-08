@@ -8,9 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 
-# Assuming these imports exist in your project structure
-from ml4ded.dinov2.dinov2_transformer import DINOv2
-from ml4ded.models.blocks import FeatureFusionBlock, _make_scratch
+from dinov2.dinov2_transformer import DINOv2
+from models.blocks import FeatureFusionBlock, _make_scratch
 
 
 # --- Utility Functions ---

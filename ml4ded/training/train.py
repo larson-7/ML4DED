@@ -388,6 +388,65 @@ class Trainer(object):
                 flat_outputs = outputs.view(B * T, C, H, W)
                 flat_targets = targets.view(B * T, H, W)
 
+                preds = torch.argmax(flat_outputs, dim=1)  # (B*T, H, W)
+
+            # Update metrics using all frames
+            self.metric.update(flat_outputs, flat_targets)
+            pixAcc, mIoU, weighted_mIoU = self.metric.get()
+
+            # For visualization, just take the last frame of the first batch element
+            if len(_preds) < 64:
+                # Grab last frame of current batch
+                last_frame_idx = T - 1
+                _preds.append(
+                    torchvision.transforms.ToTensor()(
+                        decode_segmap(preds[last_frame_idx].cpu().numpy())
+                    )
+                )
+                _targets.append(
+                    torchvision.transforms.ToTensor()(
+                        decode_segmap(flat_targets[last_frame_idx].cpu().numpy())
+                    )
+                )
+
+        _preds = torchvision.utils.make_grid(_preds, nrow=8)
+        _targets = torchvision.utils.make_grid(_targets, nrow=8)
+
+        new_pred = (pixAcc + mIoU) / 2
+        print(
+            f"pixel acc: {pixAcc:.4f}\nmIoU: {mIoU:.4f}\nweighted mIoU: {weighted_mIoU:.4f}"
+        )
+        writer.add_scalar("validation pixAcc", pixAcc, it)
+        writer.add_scalar("validation mIoU", mIoU, it)
+        writer.add_scalar("validation weighted mIoU", weighted_mIoU, it)
+        # writer.add_image("val_gt", _targets, it)
+        # writer.add_image("val_pred", _preds, it)
+
+        if new_pred > self.best_pred:
+            is_best = True
+            self.best_pred = new_pred
+
+        save_checkpoint(self.model, self.args, is_best)
+        return new_pred
+
+
+def save_checkpoint(model, args, is_best=False):
+    """Save Checkpoint"""
+    directory = os.path.expanduser(args.save_dir)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    filename = f"dinov2_seg.pth"
+    if args.model_weights_dir:
+        # Try to preserve temporal specific naming if desired
+        filename = f"dinov2_seg_temporal.pth"
+
+    filename = os.path.join(directory, filename)
+    torch.save(model.seg_head.state_dict(), filename)
+    if is_best:
+        best_filename = "dinov2_seg_best_model.pth"
+        best_filename = os.path.join(directory, best_filename)
+        shutil.copyfile(filename, best_filename)
+
 
 if __name__ == "__main__":
     args = parse_args()
@@ -397,7 +456,9 @@ if __name__ == "__main__":
         args.device = "mps"
     else:
         args.device = "cpu"
-    writer = SummaryWriter()
+
+    # Just a small unique name for tensorboard
+    writer = SummaryWriter(log_dir=f"runs/dino_temporal_win{4}")
     trainer = Trainer(args)
     trainer.train()
     if torch.cuda.is_available():
