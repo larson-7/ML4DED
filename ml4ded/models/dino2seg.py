@@ -9,8 +9,8 @@ import torch.nn.functional as F
 import torch.nn.init as init
 
 # Assuming these imports exist in your project structure
-from ..dinov2.dinov2_transformer import DINOv2
-from .blocks import FeatureFusionBlock, _make_scratch
+from ml4ded.dinov2.dinov2_transformer import DINOv2
+from ml4ded.models.blocks import FeatureFusionBlock, _make_scratch
 
 
 # --- Utility Functions ---
@@ -252,17 +252,14 @@ class DPTSegmentationHead(nn.Module):
                 temporal_tokens_out = query[:, N_cls + N :, :]  # (B, num_temporal, C)
 
                 # Note: We return temporal_tokens_out as (B, N, C) so it's ready for next CrossAttn
-
-                # Permute spatial tokens back for convolution layers
-                x = spatial_tokens_out.permute(0, 2, 1)  # (B, C, N)
-
             else:
                 if self.use_clstoken and cls_token is not None:
                     readout = cls_token.unsqueeze(1).expand_as(x)
                     x = self.readout_projects[i](torch.cat((x, readout), -1))
 
             # Reshape tokens to spatial grid
-            x = x.reshape((x.shape[0], x.shape[1], patch_h, patch_w))
+            x = x.transpose(1, 2)
+            x = x.reshape(x.shape[0], x.shape[1], patch_h, patch_w)
 
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
@@ -448,9 +445,12 @@ class Dino2Seg(nn.Module):
             for layer_idx in range(len(flat_features)):
                 p_tokens, c_token = flat_features[layer_idx]
 
-                # Reshape (B*T, ...) -> (B, T, ...) -> Select t -> (B, ...)
-                p_t = p_tokens.view(B, T, -1, p_tokens.shape[-1])[:, t, ...]
-                c_t = c_token.view(B, T, -1)[:, t, ...]
+                # 1. Handle Patch Tokens: (B*T, N, D) -> (B, T, N, D)
+                N, D = p_tokens.shape[1], p_tokens.shape[2]
+                p_t = p_tokens.view(B, T, N, D)[:, t, :, :]
+
+                # 2. Handle Class Token: (B*T, D) -> (B, T, D)
+                c_t = c_token.view(B, T, D)[:, t, :]
 
                 frame_feats_t.append((p_t, c_t))
             sequence_features.append(frame_feats_t)
@@ -524,12 +524,15 @@ def main():
     W = 630
 
     # Create fake clip
-    clip = torch.randn(B, T, C, H, W).cuda()
+    clip = torch.randn(B, T, C, H, W).to("cpu")
 
     # Init Model
     model = Dino2Seg(
-        use_temporal_consistency=True, num_temporal_tokens=4, temporal_window=3
-    ).cuda()
+        use_temporal_consistency=True,
+        num_temporal_tokens=4,
+        temporal_window=3,
+        device="cpu",
+    )
 
     # Test Clip Forward (Training Mode)
     print("Testing forward_clip...")
@@ -539,7 +542,7 @@ def main():
     # Test Inference Mode
     print("Testing inference...")
     model.reset_temporal_buffer()
-    img = torch.randn(1, 3, H, W).cuda()
+    img = torch.randn(1, 3, H, W).to("cpu")
     probs, pred = model.infer_image(img)
     print(f"Inference Pred Shape: {pred.shape}")
 

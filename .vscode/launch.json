@@ -1,0 +1,18 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch dino2seg as a Module",
+            "type": "python",
+            "request": "launch",
+            // Change "program" to "module" and use the dot-notation path:
+            "module": "ml4ded.models.dino2seg",
+            // Crucial: Set the CWD to the parent directory of ml4ded/ (i.e., ML4DED/)
+            // The debugger needs to start from a directory where "ml4ded" is visible.
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
